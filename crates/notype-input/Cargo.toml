@@ -1,0 +1,10 @@
+[package]
+name = "notype-input"
+description = "Text injection via simulated keyboard input"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+enigo = "0.3"
+thiserror = { workspace = true }
+tracing = { workspace = true }

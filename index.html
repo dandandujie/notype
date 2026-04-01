@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;1,9..40,300&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NoType</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <!-- Ambient background -->
+    <div class="ambient-bg">
+      <div class="orb orb-1"></div>
+      <div class="orb orb-2"></div>
+      <div class="orb orb-3"></div>
+    </div>
+
+    <main class="container">
+      <!-- Header -->
+      <header class="header" data-animate="fade-down">
+        <div class="brand">
+          <svg class="logo-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3Z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <line x1="12" y1="19" x2="12" y2="23"/>
+            <line x1="8" y1="23" x2="16" y2="23"/>
+          </svg>
+          <span class="brand-name">NoType</span>
+        </div>
+        <span class="version-tag" id="version"></span>
+      </header>
+
+      <!-- Status Orb -->
+      <div class="status-card glass" data-animate="fade-up" data-delay="1">
+        <div class="status-orb-wrap">
+          <div class="status-glow" id="status-glow"></div>
+          <div class="status-orb" id="status-dot"></div>
+        </div>
+        <div class="status-info">
+          <span class="status-label" id="status-text">Ready</span>
+          <span class="status-hint">Ctrl + . to record</span>
+        </div>
+      </div>
+
+      <!-- First-run Banner -->
+      <div class="banner glass" id="setup-banner" style="display:none" data-animate="fade-up" data-delay="2">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        <span>Enter your API key to get started. Hold <kbd>Ctrl+.</kbd> to record.</span>
+      </div>
+
+      <!-- Transcription Preview -->
+      <div class="preview-card glass" id="preview-box" data-animate="fade-up" data-delay="2">
+        <div class="preview-header">
+          <span class="preview-dot"></span>
+          <span class="preview-label">Transcription</span>
+        </div>
+        <p id="preview-text"></p>
+      </div>
+
+      <!-- Settings -->
+      <form id="settings-form" data-animate="fade-up" data-delay="3">
+        <div class="section-label">Configuration</div>
+
+        <div class="fields-grid">
+          <div class="field">
+            <label for="provider">Provider</label>
+            <div class="select-wrap">
+              <select id="provider">
+                <option value="gemini">Gemini</option>
+                <option value="qwen">Qwen</option>
+              </select>
+              <svg class="select-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="model-name">Model</label>
+            <div class="select-wrap">
+              <select id="model-name">
+                <optgroup label="Gemini" id="gemini-models">
+                  <option value="gemini-3-flash">gemini-3-flash</option>
+                  <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
+                </optgroup>
+                <optgroup label="Qwen" id="qwen-models">
+                  <option value="qwen3.5-omni-flash">qwen3.5-omni-flash</option>
+                  <option value="qwen3.5-omni-plus">qwen3.5-omni-plus</option>
+                  <option value="qwen3.5-omni-light">qwen3.5-omni-light</option>
+                </optgroup>
+              </select>
+              <svg class="select-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="api-key">API Key</label>
+          <div class="key-row">
+            <input type="password" id="api-key" placeholder="Enter API key..." autocomplete="off" spellcheck="false" />
+            <button type="button" id="toggle-key" class="icon-btn" title="Show/Hide">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+          <span class="hint" id="key-hint"></span>
+        </div>
+
+        <div class="fields-grid">
+          <div class="field">
+            <label for="hotkey">Hotkey</label>
+            <input type="text" id="hotkey" readonly class="mono" />
+          </div>
+
+          <div class="field">
+            <label for="audio-device">Input Device</label>
+            <div class="select-wrap">
+              <select id="audio-device">
+                <option value="">Loading...</option>
+              </select>
+              <svg class="select-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button type="submit" class="btn-save" id="save-btn">
+            <span class="btn-label">Save Changes</span>
+            <span class="btn-shine"></span>
+          </button>
+          <span class="save-status" id="save-status"></span>
+        </div>
+      </form>
+    </main>
+  </body>
+</html>

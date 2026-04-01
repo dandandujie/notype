@@ -1,0 +1,11 @@
+[package]
+name = "notype-audio"
+description = "Audio capture and encoding for NoType"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cpal = "0.15"
+hound = "3.5"
+thiserror = { workspace = true }
+tracing = { workspace = true }

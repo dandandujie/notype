@@ -1,0 +1,12 @@
+[package]
+name = "notype-config"
+description = "Configuration management for NoType"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dirs = "6"
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.8"
+tracing = { workspace = true }
