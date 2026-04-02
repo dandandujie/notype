@@ -2,30 +2,41 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 // -- Elements --
-const statusDot = document.getElementById("status-dot")!;
-const statusGlow = document.getElementById("status-glow")!;
+const pill = document.getElementById("voice-ring")!;
 const statusText = document.getElementById("status-text")!;
 const versionEl = document.getElementById("version")!;
-const previewText = document.getElementById("preview-text")!;
-const previewBox = document.getElementById("preview-box")!;
-
 const providerEl = document.getElementById("provider") as HTMLSelectElement;
 const modelEl = document.getElementById("model-name") as HTMLSelectElement;
-const apiKeyEl = document.getElementById("api-key") as HTMLInputElement;
-const toggleKeyBtn = document.getElementById("toggle-key")!;
-const keyHint = document.getElementById("key-hint")!;
+const geminiKeyEl = document.getElementById("gemini-api-key") as HTMLInputElement;
+const qwenKeyEl = document.getElementById("qwen-api-key") as HTMLInputElement;
+const geminiKeyHint = document.getElementById("gemini-key-hint")!;
+const qwenKeyHint = document.getElementById("qwen-key-hint")!;
+const promptEditor = document.getElementById("prompt-editor") as HTMLTextAreaElement;
 const hotkeyEl = document.getElementById("hotkey") as HTMLInputElement;
 const audioDeviceEl = document.getElementById("audio-device") as HTMLSelectElement;
 const settingsForm = document.getElementById("settings-form") as HTMLFormElement;
 const saveStatus = document.getElementById("save-status")!;
+const settingsPanel = document.getElementById("settings-panel")!;
+const promptsPanel = document.getElementById("prompts-panel")!;
+const toggleSettings = document.getElementById("toggle-settings")!;
+const togglePrompts = document.getElementById("toggle-prompts")!;
+const promptStatus = document.getElementById("prompt-status")!;
 
 // -- Types --
 interface Config {
   provider: string;
-  api_key: string;
+  gemini_api_key: string;
+  qwen_api_key: string;
   model_name: string;
   hotkey: string;
-  has_api_key: boolean;
+  has_gemini_key: boolean;
+  has_qwen_key: boolean;
+}
+
+interface Prompts {
+  agent: string;
+  rules: string;
+  vocabulary: string;
 }
 
 interface StatusEvent {
@@ -33,96 +44,145 @@ interface StatusEvent {
   detail: string | null;
 }
 
-// -- Status Colors (CSS custom property values) --
-const STATUS_STYLES: Record<string, { color: string; css: string }> = {
-  Ready:       { color: "var(--status-ready)",       css: "#3dd68c" },
-  Recording:   { color: "var(--status-recording)",   css: "#f05656" },
-  Recognizing: { color: "var(--status-recognizing)", css: "#f0a030" },
-  Done:        { color: "var(--status-done)",         css: "#5b9cf5" },
-  Error:       { color: "var(--status-error)",        css: "#f05656" },
-};
+// -- Prompt editor state --
+let currentPrompts: Prompts = { agent: "", rules: "", vocabulary: "" };
+let activeTab: keyof Prompts = "agent";
 
-let errorRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+// -- Panel toggles (mutual exclusive) --
+function openPanel(panel: HTMLElement, btn: HTMLElement) {
+  const other = panel === settingsPanel ? promptsPanel : settingsPanel;
+  const otherBtn = panel === settingsPanel ? togglePrompts : toggleSettings;
+  other.classList.remove("open");
+  otherBtn.classList.remove("active");
+  panel.classList.toggle("open");
+  btn.classList.toggle("active");
+}
+
+toggleSettings.addEventListener("click", () => openPanel(settingsPanel, toggleSettings));
+togglePrompts.addEventListener("click", () => openPanel(promptsPanel, togglePrompts));
+
+// -- Status --
+let errorTimer: ReturnType<typeof setTimeout> | null = null;
 
 function updateStatus(status: string, detail?: string | null) {
-  const style = STATUS_STYLES[status] || STATUS_STYLES.Ready;
+  pill.className = "rec-pill";
+  statusText.style.color = "";
 
-  statusDot.style.background = style.color;
-  statusDot.style.boxShadow = `0 0 12px ${style.css}`;
-  statusGlow.style.background = style.color;
-
-  statusText.textContent = status;
-
-  if (status === "Recording") {
-    statusDot.classList.add("pulse");
-    statusGlow.style.opacity = "0.3";
-  } else {
-    statusDot.classList.remove("pulse");
-    statusGlow.style.opacity = "0.15";
-  }
-
-  if (status === "Done" && detail) {
-    previewText.textContent = detail;
-    previewBox.classList.add("visible");
-  }
-
-  if (status === "Error" && detail) {
-    previewText.textContent = detail;
-    previewBox.classList.add("visible");
-    if (errorRecoveryTimer) clearTimeout(errorRecoveryTimer);
-    errorRecoveryTimer = setTimeout(() => updateStatus("Ready"), 5000);
-  }
-}
-
-// -- Provider/Model sync --
-function syncModelOptions() {
-  const provider = providerEl.value;
-  const geminiGroup = document.getElementById("gemini-models") as HTMLOptGroupElement;
-  const qwenGroup = document.getElementById("qwen-models") as HTMLOptGroupElement;
-
-  if (provider === "gemini") {
-    geminiGroup.style.display = "";
-    qwenGroup.style.display = "none";
-    if (modelEl.value.startsWith("qwen")) {
-      modelEl.value = "gemini-3-flash";
-    }
-  } else {
-    geminiGroup.style.display = "none";
-    qwenGroup.style.display = "";
-    if (modelEl.value.startsWith("gemini")) {
-      modelEl.value = "qwen3.5-omni-flash";
-    }
+  switch (status) {
+    case "Recording":
+      pill.classList.add("recording");
+      statusText.textContent = "Listening…";
+      break;
+    case "Recognizing":
+      pill.classList.add("recognizing");
+      statusText.textContent = "Recognizing…";
+      break;
+    case "Done":
+      pill.classList.add("done");
+      statusText.textContent = "Done";
+      break;
+    case "Error":
+      pill.classList.add("error");
+      statusText.textContent = detail || "Error";
+      statusText.style.color = "var(--pill-rec)";
+      if (errorTimer) clearTimeout(errorTimer);
+      errorTimer = setTimeout(() => updateStatus("Ready"), 4000);
+      break;
+    default:
+      statusText.textContent = "Tap to start";
+      break;
   }
 }
+
+// -- Model sync --
+function syncModels() {
+  const g = document.getElementById("gemini-models") as HTMLOptGroupElement;
+  const q = document.getElementById("qwen-models") as HTMLOptGroupElement;
+  const isGemini = providerEl.value === "gemini";
+
+  if (isGemini) {
+    g.style.display = ""; q.style.display = "none";
+    if (modelEl.value.startsWith("qwen")) modelEl.value = "gemini-3-flash-preview";
+  } else {
+    g.style.display = "none"; q.style.display = "";
+    if (modelEl.value.startsWith("gemini")) modelEl.value = "qwen3.5-omni-flash";
+  }
+
+  document.getElementById("gemini-key-field")!.style.display = isGemini ? "" : "none";
+  document.getElementById("qwen-key-field")!.style.display = isGemini ? "none" : "";
+}
+
+// -- Prompt tabs --
+function switchTab(tab: keyof Prompts) {
+  // Save current editor to state
+  currentPrompts[activeTab] = promptEditor.value;
+  activeTab = tab;
+  promptEditor.value = currentPrompts[tab];
+
+  document.querySelectorAll(".tab").forEach((t) => {
+    t.classList.toggle("active", (t as HTMLElement).dataset.tab === tab);
+  });
+}
+
+document.querySelectorAll(".tab").forEach((t) => {
+  t.addEventListener("click", () => {
+    switchTab((t as HTMLElement).dataset.tab as keyof Prompts);
+  });
+});
 
 // -- Init --
 async function init() {
   const version: string = await invoke("get_version");
   versionEl.textContent = `v${version}`;
 
+  // Config
   const config: Config = await invoke("get_config");
   providerEl.value = config.provider;
   modelEl.value = config.model_name;
   hotkeyEl.value = config.hotkey;
+  hotkeyEl.dataset.prev = config.hotkey;
+  // Show current hotkey in the hint below the pill
+  const hintEl = document.getElementById("hotkey-hint");
+  if (hintEl) hintEl.textContent = config.hotkey.replace(/\+/g, " + ");
 
-  const banner = document.getElementById("setup-banner")!;
-  if (config.has_api_key) {
-    apiKeyEl.placeholder = "••••••••  (configured)";
-    keyHint.textContent = "Leave empty to keep current key";
-    keyHint.style.color = "var(--status-ready)";
-    banner.style.display = "none";
+  if (config.has_gemini_key) {
+    geminiKeyEl.placeholder = "••••••••";
+    geminiKeyHint.textContent = "Configured";
+    geminiKeyHint.style.color = "var(--green)";
   } else {
-    keyHint.textContent = "Required — voice input is disabled";
-    keyHint.style.color = "var(--status-error)";
-    banner.style.display = "flex";
+    geminiKeyHint.textContent = "Not set";
+    geminiKeyHint.style.color = "var(--text3)";
   }
 
-  syncModelOptions();
+  if (config.has_qwen_key) {
+    qwenKeyEl.placeholder = "••••••••";
+    qwenKeyHint.textContent = "Configured";
+    qwenKeyHint.style.color = "var(--green)";
+  } else {
+    qwenKeyHint.textContent = "Not set";
+    qwenKeyHint.style.color = "var(--text3)";
+  }
 
+  syncModels();
+
+  // Prompts
+  currentPrompts = await invoke("get_prompts");
+  promptEditor.value = currentPrompts[activeTab];
+
+  // Auto-open settings if current provider has no key
+  const needsKey =
+    (config.provider === "gemini" && !config.has_gemini_key) ||
+    (config.provider === "qwen" && !config.has_qwen_key);
+  if (needsKey) {
+    settingsPanel.classList.add("open");
+    toggleSettings.classList.add("active");
+  }
+
+  // Devices
   const devices: string[] = await invoke("list_audio_devices");
   audioDeviceEl.innerHTML = "";
   if (devices.length === 0) {
-    audioDeviceEl.innerHTML = '<option value="">No devices found</option>';
+    audioDeviceEl.innerHTML = '<option value="">No device</option>';
   } else {
     for (const d of devices) {
       const opt = document.createElement("option");
@@ -132,57 +192,146 @@ async function init() {
     }
   }
 
-  await listen<StatusEvent>("notype://status", (event) => {
-    updateStatus(event.payload.status, event.payload.detail);
+  await listen<StatusEvent>("notype://status", (e) => {
+    updateStatus(e.payload.status, e.payload.detail);
   });
 }
 
-// -- Events --
-providerEl.addEventListener("change", syncModelOptions);
+// -- Hotkey capture --
+// Prevent manual typing — only accept keyboard shortcut recording
+hotkeyEl.addEventListener("beforeinput", (e) => e.preventDefault());
+hotkeyEl.addEventListener("paste", (e) => e.preventDefault());
+hotkeyEl.addEventListener("focus", () => { hotkeyEl.value = "Press shortcut…"; });
 
-toggleKeyBtn.addEventListener("click", () => {
-  apiKeyEl.type = apiKeyEl.type === "password" ? "text" : "password";
+hotkeyEl.addEventListener("keydown", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+
+  // Ignore lone modifier keys — wait for the actual key
+  if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return;
+
+  // Must have at least one modifier
+  if (!e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) return;
+
+  const parts: string[] = [];
+  if (e.metaKey) parts.push("Cmd");      // macOS Command key
+  if (e.ctrlKey) parts.push("Ctrl");     // Control key
+  if (e.shiftKey) parts.push("Shift");
+  if (e.altKey) parts.push("Alt");
+
+  // Use e.code for reliable physical key name (e.key can be garbled with modifiers)
+  const key = codeToKeyName(e.code);
+  if (!key) return;
+  parts.push(key);
+
+  hotkeyEl.value = parts.join("+");
+  hotkeyEl.blur();
 });
 
+hotkeyEl.addEventListener("blur", () => {
+  if (hotkeyEl.value === "Press shortcut…") {
+    hotkeyEl.value = hotkeyEl.dataset.prev || "Ctrl+.";
+  } else {
+    hotkeyEl.dataset.prev = hotkeyEl.value;
+  }
+});
+
+/** Map KeyboardEvent.code to a clean key name for display + backend parsing */
+function codeToKeyName(code: string): string | null {
+  // Letters: KeyA → A
+  if (code.startsWith("Key")) return code.slice(3);
+  // Digits: Digit0 → 0
+  if (code.startsWith("Digit")) return code.slice(5);
+  // Common keys
+  const map: Record<string, string> = {
+    Period: ".", Comma: ",", Slash: "/", Backslash: "\\",
+    Semicolon: ";", Quote: "'", BracketLeft: "[", BracketRight: "]",
+    Minus: "-", Equal: "=", Backquote: "`",
+    Space: "Space", Enter: "Enter", Tab: "Tab",
+    Escape: "Escape", Backspace: "Backspace", Delete: "Delete",
+    ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right",
+    F1: "F1", F2: "F2", F3: "F3", F4: "F4", F5: "F5", F6: "F6",
+    F7: "F7", F8: "F8", F9: "F9", F10: "F10", F11: "F11", F12: "F12",
+  };
+  return map[code] || null;
+}
+
+// -- Events --
+providerEl.addEventListener("change", syncModels);
+
+document.querySelectorAll(".toggle-key-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const input = document.getElementById((btn as HTMLElement).dataset.target!) as HTMLInputElement;
+    input.type = input.type === "password" ? "text" : "password";
+  });
+});
+
+// Save prompts
+document.getElementById("save-prompt")!.addEventListener("click", async () => {
+  currentPrompts[activeTab] = promptEditor.value;
+  promptStatus.textContent = "Saving…";
+  promptStatus.style.color = "var(--text3)";
+  try {
+    await invoke("save_prompts", { dto: currentPrompts });
+    promptStatus.textContent = "Saved";
+    promptStatus.style.color = "var(--green)";
+    setTimeout(() => { promptStatus.textContent = ""; }, 2000);
+  } catch (err) {
+    promptStatus.textContent = `${err}`;
+    promptStatus.style.color = "var(--pill-rec)";
+  }
+});
+
+// Reset prompt to builtin
+document.getElementById("reset-prompt")!.addEventListener("click", async () => {
+  const builtins: Prompts = await invoke("get_builtin_prompts");
+  currentPrompts[activeTab] = builtins[activeTab];
+  promptEditor.value = builtins[activeTab];
+  promptStatus.textContent = "Reset to default";
+  promptStatus.style.color = "var(--text2)";
+  setTimeout(() => { promptStatus.textContent = ""; }, 2000);
+});
+
+// Save settings
 settingsForm.addEventListener("submit", async (e) => {
   e.preventDefault();
-
-  const btn = document.getElementById("save-btn")!;
-  btn.classList.add("saving");
-  saveStatus.textContent = "Saving...";
-  saveStatus.style.color = "var(--text-tertiary)";
+  saveStatus.textContent = "Saving…";
+  saveStatus.style.color = "var(--text3)";
 
   try {
     await invoke("save_config", {
       dto: {
         provider: providerEl.value,
-        api_key: apiKeyEl.value,
+        gemini_api_key: geminiKeyEl.value,
+        qwen_api_key: qwenKeyEl.value,
         model_name: modelEl.value,
         hotkey: hotkeyEl.value,
-        has_api_key: true,
+        has_gemini_key: true,
+        has_qwen_key: true,
       },
     });
 
     saveStatus.textContent = "Saved";
-    saveStatus.style.color = "var(--status-ready)";
-    keyHint.textContent = "Key configured";
-    keyHint.style.color = "var(--status-ready)";
-    apiKeyEl.value = "";
-    apiKeyEl.placeholder = "••••••••  (configured)";
+    saveStatus.style.color = "var(--green)";
 
-    const banner = document.getElementById("setup-banner")!;
-    banner.style.display = "none";
+    if (geminiKeyEl.value) {
+      geminiKeyEl.value = "";
+      geminiKeyEl.placeholder = "••••••••";
+      geminiKeyHint.textContent = "Configured";
+      geminiKeyHint.style.color = "var(--green)";
+    }
+    if (qwenKeyEl.value) {
+      qwenKeyEl.value = "";
+      qwenKeyEl.placeholder = "••••••••";
+      qwenKeyHint.textContent = "Configured";
+      qwenKeyHint.style.color = "var(--green)";
+    }
 
-    setTimeout(() => {
-      saveStatus.textContent = "";
-      btn.classList.remove("saving");
-    }, 2000);
+    setTimeout(() => { saveStatus.textContent = ""; }, 2000);
   } catch (err) {
     saveStatus.textContent = `${err}`;
-    saveStatus.style.color = "var(--status-error)";
-    btn.classList.remove("saving");
+    saveStatus.style.color = "var(--pill-rec)";
   }
 });
 
-// -- Boot --
 window.addEventListener("DOMContentLoaded", init);

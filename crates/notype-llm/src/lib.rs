@@ -4,7 +4,6 @@
 //! trait for voice-to-text recognition.
 
 pub mod gemini;
-mod prompt;
 pub mod qwen;
 
 use std::future::Future;
@@ -34,11 +33,12 @@ pub struct RecognitionResult {
 
 /// Unified trait for voice recognition providers (object-safe).
 pub trait VoiceRecognizer: Send + Sync {
-    /// Recognize speech from audio data.
+    /// Recognize speech from audio data with a custom system prompt.
     fn recognize(
         &self,
         audio_data: Vec<u8>,
         mime_type: String,
+        system_prompt: String,
     ) -> Pin<Box<dyn Future<Output = Result<RecognitionResult>> + Send + '_>>;
 }
 

@@ -9,9 +9,9 @@ use base64::Engine;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::{prompt, LlmError, RecognitionResult, Result, VoiceRecognizer};
+use crate::{LlmError, RecognitionResult, Result, VoiceRecognizer};
 
-const DEFAULT_MODEL: &str = "gemini-3-flash";
+const DEFAULT_MODEL: &str = "gemini-3-flash-preview";
 const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -42,8 +42,9 @@ impl VoiceRecognizer for GeminiClient {
         &self,
         audio_data: Vec<u8>,
         mime_type: String,
+        system_prompt: String,
     ) -> Pin<Box<dyn Future<Output = Result<RecognitionResult>> + Send + '_>> {
-        Box::pin(self.do_recognize(audio_data, mime_type))
+        Box::pin(self.do_recognize(audio_data, mime_type, system_prompt))
     }
 }
 
@@ -52,13 +53,14 @@ impl GeminiClient {
         &self,
         audio_data: Vec<u8>,
         mime_type: String,
+        system_prompt: String,
     ) -> Result<RecognitionResult> {
         let audio_base64 = BASE64.encode(&audio_data);
 
         let body = serde_json::json!({
             "contents": [{
                 "parts": [
-                    { "text": prompt::TRANSCRIPTION_PROMPT },
+                    { "text": system_prompt },
                     {
                         "inline_data": {
                             "mime_type": &mime_type,
@@ -159,7 +161,7 @@ mod tests {
     #[test]
     fn test_default_model() {
         let client = GeminiClient::new("test-key".into(), None);
-        assert_eq!(client.model, "gemini-3-flash");
+        assert_eq!(client.model, "gemini-3-flash-preview");
     }
 
     #[test]

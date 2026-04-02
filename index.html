@@ -2,9 +2,6 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;1,9..40,300&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>NoType</title>
@@ -12,126 +9,124 @@
   </head>
 
   <body>
-    <!-- Ambient background -->
-    <div class="ambient-bg">
-      <div class="orb orb-1"></div>
-      <div class="orb orb-2"></div>
-      <div class="orb orb-3"></div>
-    </div>
+    <main class="app">
 
-    <main class="container">
-      <!-- Header -->
-      <header class="header" data-animate="fade-down">
-        <div class="brand">
-          <svg class="logo-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3Z"/>
-            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-            <line x1="12" y1="19" x2="12" y2="23"/>
-            <line x1="8" y1="23" x2="16" y2="23"/>
-          </svg>
-          <span class="brand-name">NoType</span>
+      <!-- Top bar -->
+      <header class="topbar">
+        <span class="brand">NoType</span>
+        <div class="topbar-actions">
+          <button type="button" class="topbar-btn" id="toggle-prompts" title="Prompts">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+          </button>
+          <button type="button" class="topbar-btn" id="toggle-settings" title="Settings">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
         </div>
-        <span class="version-tag" id="version"></span>
       </header>
 
-      <!-- Status Orb -->
-      <div class="status-card glass" data-animate="fade-up" data-delay="1">
-        <div class="status-orb-wrap">
-          <div class="status-glow" id="status-glow"></div>
-          <div class="status-orb" id="status-dot"></div>
+      <!-- Main voice area -->
+      <section class="voice-area">
+        <p class="status-label" id="status-text">Tap to start</p>
+
+        <button class="rec-pill" id="voice-ring" type="button">
+          <span class="waveform" id="waveform">
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          </span>
+        </button>
+
+        <p class="shortcut-hint">or hold <kbd id="hotkey-hint">Ctrl + .</kbd></p>
+      </section>
+
+      <!-- Prompts panel -->
+      <section class="panel prompts-panel" id="prompts-panel">
+        <div class="panel-tabs">
+          <button class="tab active" data-tab="agent">角色指令</button>
+          <button class="tab" data-tab="rules">转录规则</button>
+          <button class="tab" data-tab="vocabulary">专有词汇</button>
         </div>
-        <div class="status-info">
-          <span class="status-label" id="status-text">Ready</span>
-          <span class="status-hint">Ctrl + . to record</span>
+        <div class="editor-wrap">
+          <textarea class="editor" id="prompt-editor" spellcheck="false" placeholder="Edit prompt here…"></textarea>
         </div>
-      </div>
-
-      <!-- First-run Banner -->
-      <div class="banner glass" id="setup-banner" style="display:none" data-animate="fade-up" data-delay="2">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-        <span>Enter your API key to get started. Hold <kbd>Ctrl+.</kbd> to record.</span>
-      </div>
-
-      <!-- Transcription Preview -->
-      <div class="preview-card glass" id="preview-box" data-animate="fade-up" data-delay="2">
-        <div class="preview-header">
-          <span class="preview-dot"></span>
-          <span class="preview-label">Transcription</span>
+        <div class="panel-footer">
+          <button type="button" class="btn-text" id="reset-prompt">Reset to default</button>
+          <span class="panel-msg" id="prompt-status"></span>
+          <button type="button" class="btn-save-sm" id="save-prompt">Save</button>
         </div>
-        <p id="preview-text"></p>
-      </div>
+      </section>
 
-      <!-- Settings -->
-      <form id="settings-form" data-animate="fade-up" data-delay="3">
-        <div class="section-label">Configuration</div>
+      <!-- Settings panel -->
+      <section class="panel settings-panel" id="settings-panel">
+        <form id="settings-form">
+          <div class="s-row">
+            <label class="s-field">
+              <span class="s-label">Provider</span>
+              <div class="s-select">
+                <select id="provider">
+                  <option value="gemini">Gemini</option>
+                  <option value="qwen">Qwen</option>
+                </select>
+              </div>
+            </label>
+            <label class="s-field">
+              <span class="s-label">Model</span>
+              <div class="s-select">
+                <select id="model-name">
+                  <optgroup label="Gemini" id="gemini-models">
+                    <option value="gemini-3-flash-preview">gemini-3-flash</option>
+                    <option value="gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite</option>
+                  </optgroup>
+                  <optgroup label="Qwen" id="qwen-models">
+                    <option value="qwen3.5-omni-flash">qwen3.5-omni-flash</option>
+                    <option value="qwen3.5-omni-plus">qwen3.5-omni-plus</option>
+                  </optgroup>
+                </select>
+              </div>
+            </label>
+          </div>
 
-        <div class="fields-grid">
-          <div class="field">
-            <label for="provider">Provider</label>
-            <div class="select-wrap">
-              <select id="provider">
-                <option value="gemini">Gemini</option>
-                <option value="qwen">Qwen</option>
-              </select>
-              <svg class="select-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+          <label class="s-field" id="gemini-key-field">
+            <span class="s-label">Gemini API Key</span>
+            <div class="s-key-row">
+              <input type="password" id="gemini-api-key" placeholder="Paste Gemini key" autocomplete="off" spellcheck="false" />
+              <button type="button" class="s-eye toggle-key-btn" data-target="gemini-api-key" title="Show/Hide">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
             </div>
-          </div>
+            <span class="s-hint" id="gemini-key-hint"></span>
+          </label>
 
-          <div class="field">
-            <label for="model-name">Model</label>
-            <div class="select-wrap">
-              <select id="model-name">
-                <optgroup label="Gemini" id="gemini-models">
-                  <option value="gemini-3-flash">gemini-3-flash</option>
-                  <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
-                </optgroup>
-                <optgroup label="Qwen" id="qwen-models">
-                  <option value="qwen3.5-omni-flash">qwen3.5-omni-flash</option>
-                  <option value="qwen3.5-omni-plus">qwen3.5-omni-plus</option>
-                  <option value="qwen3.5-omni-light">qwen3.5-omni-light</option>
-                </optgroup>
-              </select>
-              <svg class="select-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+          <label class="s-field" id="qwen-key-field">
+            <span class="s-label">Qwen API Key</span>
+            <div class="s-key-row">
+              <input type="password" id="qwen-api-key" placeholder="Paste Qwen key" autocomplete="off" spellcheck="false" />
+              <button type="button" class="s-eye toggle-key-btn" data-target="qwen-api-key" title="Show/Hide">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
             </div>
-          </div>
-        </div>
+            <span class="s-hint" id="qwen-key-hint"></span>
+          </label>
 
-        <div class="field">
-          <label for="api-key">API Key</label>
-          <div class="key-row">
-            <input type="password" id="api-key" placeholder="Enter API key..." autocomplete="off" spellcheck="false" />
-            <button type="button" id="toggle-key" class="icon-btn" title="Show/Hide">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-            </button>
-          </div>
-          <span class="hint" id="key-hint"></span>
-        </div>
-
-        <div class="fields-grid">
-          <div class="field">
-            <label for="hotkey">Hotkey</label>
-            <input type="text" id="hotkey" readonly class="mono" />
+          <div class="s-row">
+            <label class="s-field">
+              <span class="s-label">Hotkey</span>
+              <input type="text" id="hotkey" placeholder="Click and press keys…" />
+            </label>
+            <label class="s-field">
+              <span class="s-label">Device</span>
+              <div class="s-select">
+                <select id="audio-device"><option>Loading…</option></select>
+              </div>
+            </label>
           </div>
 
-          <div class="field">
-            <label for="audio-device">Input Device</label>
-            <div class="select-wrap">
-              <select id="audio-device">
-                <option value="">Loading...</option>
-              </select>
-              <svg class="select-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
-            </div>
+          <div class="s-footer">
+            <button type="submit" class="s-save">Save</button>
+            <span class="s-msg" id="save-status"></span>
+            <span class="s-version" id="version"></span>
           </div>
-        </div>
+        </form>
+      </section>
 
-        <div class="actions">
-          <button type="submit" class="btn-save" id="save-btn">
-            <span class="btn-label">Save Changes</span>
-            <span class="btn-shine"></span>
-          </button>
-          <span class="save-status" id="save-status"></span>
-        </div>
-      </form>
     </main>
   </body>
 </html>
