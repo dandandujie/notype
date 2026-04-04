@@ -106,3 +106,4 @@ macOS 上首次运行需要授权麦克风和辅助功能权限。
 ## License
 
 MIT
+感谢Linux.do社区
