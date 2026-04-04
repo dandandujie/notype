@@ -9,6 +9,8 @@ pub mod qwen;
 use std::future::Future;
 use std::pin::Pin;
 
+use tokio::sync::mpsc;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
     #[error("API request failed: {0}")]
@@ -39,6 +41,16 @@ pub trait VoiceRecognizer: Send + Sync {
         audio_data: Vec<u8>,
         mime_type: String,
         system_prompt: String,
+    ) -> Pin<Box<dyn Future<Output = Result<RecognitionResult>> + Send + '_>>;
+
+    /// Streaming recognition: sends text chunks through the channel as they arrive.
+    /// Returns the full concatenated text when done.
+    fn recognize_stream(
+        &self,
+        audio_data: Vec<u8>,
+        mime_type: String,
+        system_prompt: String,
+        tx: mpsc::UnboundedSender<String>,
     ) -> Pin<Box<dyn Future<Output = Result<RecognitionResult>> + Send + '_>>;
 }
 

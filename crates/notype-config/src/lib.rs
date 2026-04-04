@@ -82,7 +82,8 @@ impl Default for GeneralConfig {
 /// Built-in default prompt content for each module.
 pub mod builtin_prompts {
     pub const AGENT: &str = "\
-你是一个语音转文字引擎。请将音频精确转录为文字。
+你是一个语音转文字引擎。请将音频从头到尾完整转录为文字。
+必须转录音频中的每一句话，不得省略、概括或跳过任何部分。
 只输出转录后的文字，不要任何解释、前缀或额外内容。";
 
     pub const RULES: &str = "\

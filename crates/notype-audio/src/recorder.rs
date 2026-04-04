@@ -15,6 +15,7 @@ use crate::{device, encoder, AudioData, AudioError, Result};
 enum Command {
     Start,
     Stop(mpsc::Sender<Result<AudioData>>),
+    Snapshot(mpsc::Sender<Result<AudioData>>),
 }
 
 /// Controls microphone recording with start/stop semantics.
@@ -58,6 +59,19 @@ impl Recorder {
         self.cmd_tx
             .send(Command::Start)
             .map_err(|e| AudioError::StreamError(e.to_string()))
+    }
+
+    /// Snapshot the audio recorded so far without stopping.
+    /// Returns None if not currently recording.
+    pub fn snapshot(&self) -> Option<Result<AudioData>> {
+        if !self.is_recording() {
+            return None;
+        }
+        let (result_tx, result_rx) = mpsc::channel();
+        self.cmd_tx
+            .send(Command::Snapshot(result_tx))
+            .ok()?;
+        result_rx.recv().ok()
     }
 
     /// Stop recording and return the captured audio as WAV.
@@ -138,9 +152,33 @@ fn audio_thread(
                     }
                 }
             }
+            Command::Snapshot(result_tx) => {
+                let samples: Vec<f32> = buffer.lock().unwrap().clone();
+                let total = samples.len() as f32;
+                let duration_secs = total / (sample_rate as f32 * channels as f32);
+
+                tracing::debug!(samples = samples.len(), duration_secs, "Audio snapshot taken");
+
+                let result =
+                    encoder::encode_wav(&samples, sample_rate, channels).map(|wav_bytes| {
+                        AudioData {
+                            wav_bytes,
+                            sample_rate,
+                            channels,
+                            duration_secs,
+                        }
+                    });
+
+                let _ = result_tx.send(result);
+            }
             Command::Stop(result_tx) => {
+                // Drop stream first to flush any in-flight audio data,
+                // THEN set recording=false. Otherwise the callback sees
+                // recording=false and discards the last chunk.
+                stream.take();
+                // Brief yield to let any in-flight callbacks finish writing
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 recording.store(false, Ordering::Relaxed);
-                stream.take(); // drop stream to release device
 
                 let samples: Vec<f32> = std::mem::take(&mut *buffer.lock().unwrap());
                 let total = samples.len() as f32;

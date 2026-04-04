@@ -1,6 +1,7 @@
 mod bubble;
 mod tray;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use notype_audio::Recorder;
@@ -9,11 +10,12 @@ use notype_llm::VoiceRecognizer;
 use tauri::{Emitter, Manager};
 
 struct AppState {
-    recorder: Recorder,
+    recorder: Arc<Recorder>,
     inputter: Arc<TextInputter>,
     recognizer: Arc<tokio::sync::RwLock<Option<Box<dyn VoiceRecognizer>>>>,
     config: Arc<tokio::sync::RwLock<notype_config::AppConfig>>,
     runtime: tokio::runtime::Handle,
+    bubble_generation: Arc<AtomicU64>,
 }
 
 // -- Frontend event payloads --
@@ -221,11 +223,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
-            recorder: Recorder::new(None),
+            recorder: Arc::new(Recorder::new(None)),
             inputter: Arc::new(TextInputter::new()),
             recognizer: Arc::new(tokio::sync::RwLock::new(recognizer)),
             config: Arc::new(tokio::sync::RwLock::new(config)),
             runtime: runtime.handle().clone(),
+            bubble_generation: Arc::new(AtomicU64::new(0)),
         })
         .on_window_event(|window, event| {
             // Only intercept close on main window (hide to tray)
@@ -297,6 +300,7 @@ fn setup_global_shortcut(app: &tauri::App) -> std::result::Result<(), Box<dyn st
                 match event.state() {
                     ShortcutState::Pressed => {
                         if !recorder.is_recording() {
+                            state.bubble_generation.fetch_add(1, Ordering::SeqCst);
                             if let Err(e) = recorder.start() {
                                 tracing::error!("Failed to start recording: {e}");
                                 emit_status(app, "Error", Some(&e.to_string()));
@@ -304,6 +308,21 @@ fn setup_global_shortcut(app: &tauri::App) -> std::result::Result<(), Box<dyn st
                                 bubble::show_bubble(app);
                                 bubble::set_recording(app);
                                 emit_status(app, "Recording", None);
+
+                                // Start interim transcription loop
+                                let rec_clone = Arc::clone(&state.recorder);
+                                let recognizer = Arc::clone(&state.recognizer);
+                                let cfg = Arc::clone(&state.config);
+                                let handle = app.clone();
+                                let gen = Arc::clone(&state.bubble_generation);
+                                let gen_val = gen.load(Ordering::SeqCst);
+                                state.runtime.spawn(async move {
+                                    interim_loop(
+                                        &handle, &rec_clone, &recognizer, &cfg,
+                                        &gen, gen_val,
+                                    )
+                                    .await;
+                                });
                             }
                         }
                     }
@@ -321,11 +340,14 @@ fn setup_global_shortcut(app: &tauri::App) -> std::result::Result<(), Box<dyn st
                                     let recognizer = Arc::clone(&state.recognizer);
                                     let cfg = Arc::clone(&state.config);
                                     let inputter = Arc::clone(&state.inputter);
+                                    let gen = Arc::clone(&state.bubble_generation);
                                     let rt = state.runtime.clone();
                                     let handle = app.clone();
                                     rt.spawn(async move {
-                                        process_audio(&handle, &recognizer, &cfg, &inputter, audio)
-                                            .await;
+                                        process_audio(
+                                            &handle, &recognizer, &cfg, &inputter, &gen, audio,
+                                        )
+                                        .await;
                                     });
                                 }
                                 Err(e) => {
@@ -350,6 +372,71 @@ fn setup_global_shortcut(_app: &tauri::App) -> std::result::Result<(), Box<dyn s
     Ok(())
 }
 
+// -- Interim Transcription (live preview while recording) --
+
+const INTERIM_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(2000);
+const INTERIM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2500);
+const INTERIM_MIN_DURATION: f32 = 1.0;
+
+async fn interim_loop(
+    app: &tauri::AppHandle,
+    recorder: &Recorder,
+    recognizer: &tokio::sync::RwLock<Option<Box<dyn VoiceRecognizer>>>,
+    config: &tokio::sync::RwLock<notype_config::AppConfig>,
+    generation: &AtomicU64,
+    gen_val: u64,
+) {
+    // Wait before first interim attempt
+    tokio::time::sleep(INTERIM_INITIAL_DELAY).await;
+
+    loop {
+        // Stop if recording ended or a new session started
+        if generation.load(Ordering::SeqCst) != gen_val || !recorder.is_recording() {
+            break;
+        }
+
+        let snapshot = recorder.snapshot();
+        let Some(Ok(audio)) = snapshot else {
+            break;
+        };
+
+        if audio.duration_secs < INTERIM_MIN_DURATION {
+            tokio::time::sleep(INTERIM_INTERVAL).await;
+            continue;
+        }
+
+        let guard = recognizer.read().await;
+        let Some(rec) = guard.as_ref() else {
+            break;
+        };
+
+        let prompt = config.read().await.prompts.compose();
+
+        tracing::info!(duration = audio.duration_secs, "Interim transcription request");
+        match rec
+            .recognize(audio.wav_bytes, "audio/wav".into(), prompt)
+            .await
+        {
+            Ok(result) if !result.text.is_empty() => {
+                // Only update if still in the same recording session
+                if generation.load(Ordering::SeqCst) == gen_val && recorder.is_recording() {
+                    tracing::info!(text = %result.text, "Interim result");
+                    bubble::set_interim(app, &result.text);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Interim transcription failed: {e}");
+            }
+            _ => {}
+        }
+
+        drop(guard);
+
+        // Wait before next interim
+        tokio::time::sleep(INTERIM_INTERVAL).await;
+    }
+}
+
 // -- Audio Processing Pipeline --
 
 async fn process_audio(
@@ -357,23 +444,31 @@ async fn process_audio(
     recognizer: &tokio::sync::RwLock<Option<Box<dyn VoiceRecognizer>>>,
     config: &tokio::sync::RwLock<notype_config::AppConfig>,
     inputter: &TextInputter,
+    generation: &AtomicU64,
     audio: notype_audio::AudioData,
 ) {
+    let gen_at_start = generation.load(Ordering::SeqCst);
+
     let guard = recognizer.read().await;
     let Some(rec) = guard.as_ref() else {
         tracing::warn!("No recognizer configured");
         bubble::set_error(app, "No API key configured");
         emit_status(app, "Error", Some("No API key configured"));
-        auto_hide_bubble(app, 3).await;
+        auto_hide_bubble(app, generation, gen_at_start, 3).await;
         return;
     };
 
     let system_prompt = config.read().await.prompts.compose();
 
-    match rec
-        .recognize(audio.wav_bytes, "audio/wav".into(), system_prompt)
-        .await
-    {
+    // Use streaming to get SSE chunks, but display final result directly
+    // (interim preview already shown during recording)
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let result = rec
+        .recognize_stream(audio.wav_bytes, "audio/wav".into(), system_prompt, tx)
+        .await;
+
+    match result {
         Ok(result) if result.text.is_empty() => {
             tracing::info!("Empty transcription (silence?)");
             bubble::hide_bubble(app);
@@ -381,27 +476,37 @@ async fn process_audio(
         }
         Ok(result) => {
             tracing::info!(text = %result.text, "Transcription received");
+            // Directly replace interim text — no typewriter replay
             bubble::set_result(app, &result.text);
             emit_status(app, "Done", Some(&result.text));
             if let Err(e) = inputter.type_text(&result.text) {
                 tracing::error!("Failed to type text: {e}");
                 emit_status(app, "Error", Some(&e.to_string()));
             }
-            auto_hide_bubble(app, 3).await;
+            let display_secs = (5 + result.text.len() as u64 / 50).min(15);
+            auto_hide_bubble(app, generation, gen_at_start, display_secs).await;
             emit_status(app, "Ready", None);
         }
         Err(e) => {
             tracing::error!("LLM recognition failed: {e}");
             bubble::set_error(app, &e.to_string());
             emit_status(app, "Error", Some(&e.to_string()));
-            auto_hide_bubble(app, 3).await;
+            auto_hide_bubble(app, generation, gen_at_start, 5).await;
         }
     }
 }
 
-async fn auto_hide_bubble(app: &tauri::AppHandle, secs: u64) {
+/// Hide bubble after a delay, but only if no new recording has started since.
+async fn auto_hide_bubble(
+    app: &tauri::AppHandle,
+    generation: &AtomicU64,
+    expected_gen: u64,
+    secs: u64,
+) {
     tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-    bubble::hide_bubble(app);
+    if generation.load(Ordering::SeqCst) == expected_gen {
+        bubble::hide_bubble(app);
+    }
 }
 
 // -- Helpers --
