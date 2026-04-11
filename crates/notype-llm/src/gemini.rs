@@ -61,6 +61,37 @@ impl VoiceRecognizer for GeminiClient {
 }
 
 impl GeminiClient {
+    pub async fn postprocess_text_stream(
+        &self,
+        system_prompt: String,
+        raw_text: String,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> Result<RecognitionResult> {
+        let body = serde_json::json!({
+            "systemInstruction": {
+                "parts": [{ "text": system_prompt }]
+            },
+            "contents": [{
+                "parts": [
+                    { "text": raw_text }
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 8192
+            }
+        });
+
+        let url = format!(
+            "{API_BASE}/models/{}:streamGenerateContent?alt=sse&key={}",
+            self.model, self.api_key
+        );
+
+        tracing::debug!(model = %self.model, "Sending text post-process request to Gemini (streaming)");
+        let text = self.send_stream(&url, &body, Some(tx)).await?;
+        Ok(RecognitionResult { text })
+    }
+
     async fn do_recognize(
         &self,
         audio_data: Vec<u8>,
@@ -174,7 +205,11 @@ impl GeminiClient {
         while let Some(chunk_result) = stream.next().await {
             let bytes = chunk_result.map_err(|e| LlmError::RequestFailed(e.to_string()))?;
             chunk_idx += 1;
-            tracing::debug!(chunk_idx, bytes = bytes.len(), "Gemini SSE network chunk received");
+            tracing::debug!(
+                chunk_idx,
+                bytes = bytes.len(),
+                "Gemini SSE network chunk received"
+            );
             raw_buf.extend_from_slice(&bytes);
 
             while let Some(newline_pos) = raw_buf.iter().position(|&b| b == b'\n') {

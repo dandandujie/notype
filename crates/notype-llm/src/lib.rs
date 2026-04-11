@@ -1,8 +1,9 @@
 //! LLM API client module for NoType.
 //!
-//! Abstracts multimodal LLM providers (Gemini, Qwen) behind a unified
+//! Abstracts multimodal/ASR providers (Gemini, Qwen, Doubao) behind a unified
 //! trait for voice-to-text recognition.
 
+pub mod doubao;
 pub mod gemini;
 pub mod qwen;
 
@@ -59,17 +60,62 @@ pub trait VoiceRecognizer: Send + Sync {
 pub enum Provider {
     Gemini,
     Qwen,
+    Doubao,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RecognizerOptions {
+    pub model: Option<String>,
+    pub doubao_base_url: Option<String>,
+    pub doubao_official_app_key: Option<String>,
+    pub doubao_official_access_key: Option<String>,
 }
 
 /// Create a recognizer from provider config.
 pub fn create_recognizer(
     provider: Provider,
     api_key: String,
-    model: Option<String>,
+    options: RecognizerOptions,
 ) -> Box<dyn VoiceRecognizer> {
     match provider {
-        Provider::Gemini => Box::new(gemini::GeminiClient::new(api_key, model)),
-        Provider::Qwen => Box::new(qwen::QwenClient::new(api_key, model)),
+        Provider::Gemini => Box::new(gemini::GeminiClient::new(api_key, options.model)),
+        Provider::Qwen => Box::new(qwen::QwenClient::new(api_key, options.model)),
+        Provider::Doubao => Box::new(doubao::DoubaoClient::new(
+            api_key,
+            options.model,
+            options.doubao_base_url,
+            options.doubao_official_app_key,
+            options.doubao_official_access_key,
+        )),
+    }
+}
+
+/// Stream post-processing for ASR raw text.
+/// Currently supported providers: Gemini, Qwen.
+pub async fn postprocess_text_stream(
+    provider: Provider,
+    api_key: String,
+    model: Option<String>,
+    system_prompt: String,
+    raw_text: String,
+    tx: mpsc::UnboundedSender<String>,
+) -> Result<RecognitionResult> {
+    match provider {
+        Provider::Gemini => {
+            let client = gemini::GeminiClient::new(api_key, model);
+            client
+                .postprocess_text_stream(system_prompt, raw_text, tx)
+                .await
+        }
+        Provider::Qwen => {
+            let client = qwen::QwenClient::new(api_key, model);
+            client
+                .postprocess_text_stream(system_prompt, raw_text, tx)
+                .await
+        }
+        Provider::Doubao => Err(LlmError::ModelNotAvailable(
+            "Doubao ASR is not a text post-process provider".into(),
+        )),
     }
 }
 

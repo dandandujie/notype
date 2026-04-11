@@ -35,3 +35,22 @@ pub struct AudioData {
     pub channels: u16,
     pub duration_secs: f32,
 }
+
+/// Slice of recorded audio with absolute sample indexes in the current session.
+#[derive(Debug, Clone)]
+pub struct AudioSlice {
+    pub audio: AudioData,
+    pub start_sample: usize,
+    pub end_sample: usize,
+}
+
+/// PCM slice for realtime streaming, 16-bit little-endian mono/stereo.
+#[derive(Debug, Clone)]
+pub struct AudioPcmSlice {
+    pub pcm_s16le: Vec<u8>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub duration_secs: f32,
+    pub start_sample: usize,
+    pub end_sample: usize,
+}

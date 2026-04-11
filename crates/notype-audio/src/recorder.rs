@@ -10,12 +10,20 @@ use std::sync::{
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 
-use crate::{device, encoder, AudioData, AudioError, Result};
+use crate::{device, encoder, AudioData, AudioError, AudioPcmSlice, AudioSlice, Result};
 
 enum Command {
     Start,
     Stop(mpsc::Sender<Result<AudioData>>),
     Snapshot(mpsc::Sender<Result<AudioData>>),
+    SnapshotFrom {
+        from_sample: usize,
+        result_tx: mpsc::Sender<Result<AudioSlice>>,
+    },
+    SnapshotPcmFrom {
+        from_sample: usize,
+        result_tx: mpsc::Sender<Result<AudioPcmSlice>>,
+    },
 }
 
 /// Controls microphone recording with start/stop semantics.
@@ -68,8 +76,38 @@ impl Recorder {
             return None;
         }
         let (result_tx, result_rx) = mpsc::channel();
+        self.cmd_tx.send(Command::Snapshot(result_tx)).ok()?;
+        result_rx.recv().ok()
+    }
+
+    /// Snapshot audio starting at `from_sample` (absolute sample index in current session).
+    /// Returns None if not currently recording.
+    pub fn snapshot_from(&self, from_sample: usize) -> Option<Result<AudioSlice>> {
+        if !self.is_recording() {
+            return None;
+        }
+        let (result_tx, result_rx) = mpsc::channel();
         self.cmd_tx
-            .send(Command::Snapshot(result_tx))
+            .send(Command::SnapshotFrom {
+                from_sample,
+                result_tx,
+            })
+            .ok()?;
+        result_rx.recv().ok()
+    }
+
+    /// Snapshot PCM audio (`s16le`) starting at `from_sample`.
+    /// Returns None if not currently recording.
+    pub fn snapshot_pcm_from(&self, from_sample: usize) -> Option<Result<AudioPcmSlice>> {
+        if !self.is_recording() {
+            return None;
+        }
+        let (result_tx, result_rx) = mpsc::channel();
+        self.cmd_tx
+            .send(Command::SnapshotPcmFrom {
+                from_sample,
+                result_tx,
+            })
             .ok()?;
         result_rx.recv().ok()
     }
@@ -157,7 +195,11 @@ fn audio_thread(
                 let total = samples.len() as f32;
                 let duration_secs = total / (sample_rate as f32 * channels as f32);
 
-                tracing::debug!(samples = samples.len(), duration_secs, "Audio snapshot taken");
+                tracing::debug!(
+                    samples = samples.len(),
+                    duration_secs,
+                    "Audio snapshot taken"
+                );
 
                 let result =
                     encoder::encode_wav(&samples, sample_rate, channels).map(|wav_bytes| {
@@ -170,6 +212,79 @@ fn audio_thread(
                     });
 
                 let _ = result_tx.send(result);
+            }
+            Command::SnapshotFrom {
+                from_sample,
+                result_tx,
+            } => {
+                let guard = buffer.lock().unwrap();
+                let end_sample = guard.len();
+                let start_sample = from_sample.min(end_sample);
+                let samples = guard[start_sample..end_sample].to_vec();
+                drop(guard);
+
+                let total = samples.len() as f32;
+                let duration_secs = total / (sample_rate as f32 * channels as f32);
+
+                tracing::debug!(
+                    start_sample,
+                    end_sample,
+                    samples = samples.len(),
+                    duration_secs,
+                    "Audio range snapshot taken"
+                );
+
+                let result =
+                    encoder::encode_wav(&samples, sample_rate, channels).map(|wav_bytes| {
+                        AudioSlice {
+                            audio: AudioData {
+                                wav_bytes,
+                                sample_rate,
+                                channels,
+                                duration_secs,
+                            },
+                            start_sample,
+                            end_sample,
+                        }
+                    });
+
+                let _ = result_tx.send(result);
+            }
+            Command::SnapshotPcmFrom {
+                from_sample,
+                result_tx,
+            } => {
+                let guard = buffer.lock().unwrap();
+                let end_sample = guard.len();
+                let start_sample = from_sample.min(end_sample);
+                let samples = &guard[start_sample..end_sample];
+                let total = samples.len() as f32;
+                let duration_secs = total / (sample_rate as f32 * channels as f32);
+
+                let mut pcm_s16le = Vec::with_capacity(samples.len() * 2);
+                for &sample in samples {
+                    let s = sample.clamp(-1.0, 1.0);
+                    let i = (s * i16::MAX as f32) as i16;
+                    pcm_s16le.extend_from_slice(&i.to_le_bytes());
+                }
+                drop(guard);
+
+                tracing::trace!(
+                    start_sample,
+                    end_sample,
+                    pcm_bytes = pcm_s16le.len(),
+                    duration_secs,
+                    "Audio PCM range snapshot taken"
+                );
+
+                let _ = result_tx.send(Ok(AudioPcmSlice {
+                    pcm_s16le,
+                    sample_rate,
+                    channels,
+                    duration_secs,
+                    start_sample,
+                    end_sample,
+                }));
             }
             Command::Stop(result_tx) => {
                 // Drop stream first to flush any in-flight audio data,

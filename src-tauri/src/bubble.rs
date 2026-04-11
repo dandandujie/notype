@@ -4,8 +4,7 @@ use tauri::{Manager, Webview, WebviewUrl, WebviewWindowBuilder};
 
 const BUBBLE_LABEL: &str = "bubble";
 const BUBBLE_WIDTH: f64 = 380.0;
-const BUBBLE_RECORDING_H: f64 = 140.0;
-const BUBBLE_RESULT_MAX_H: f64 = 280.0;
+const BUBBLE_RECORDING_H: f64 = 210.0;
 
 /// Show the bubble near the current mouse cursor.
 /// MUST NOT steal focus from the user's active application.
@@ -84,11 +83,13 @@ pub fn hide_bubble(app: &tauri::AppHandle) {
 /// Update bubble state via JS eval — avoids event timing issues.
 pub fn set_recording(app: &tauri::AppHandle) {
     eval_bubble(app, "showRecording()");
+    set_cursor_passthrough(app, true);
     set_bubble_size(app, BUBBLE_RECORDING_H);
 }
 
 pub fn set_recognizing(app: &tauri::AppHandle) {
     eval_bubble(app, "showRecognizing()");
+    set_cursor_passthrough(app, true);
 }
 
 /// Show interim (partial) transcription while still recording.
@@ -98,17 +99,8 @@ pub fn set_interim(app: &tauri::AppHandle, text: &str) {
         .replace('\'', "\\'")
         .replace('\n', "\\n");
     eval_bubble(app, &format!("showInterim('{escaped}')"));
-    resize_for_text(app, text);
-}
-
-/// Resize bubble to fit current text length.
-pub fn resize_for_text(app: &tauri::AppHandle, full_text: &str) {
-    let char_count = full_text.len();
-    let wrap_lines = (char_count as f64 / 30.0).ceil().max(1.0);
-    let line_breaks = full_text.lines().count().max(1) as f64;
-    let lines = wrap_lines.max(line_breaks);
-    let estimated = 70.0 + (lines * 25.0);
-    set_bubble_size(app, estimated.min(BUBBLE_RESULT_MAX_H));
+    set_cursor_passthrough(app, true);
+    // JS side handles precise resize via Pretext measurement
 }
 
 pub fn set_result(app: &tauri::AppHandle, text: &str) {
@@ -117,7 +109,13 @@ pub fn set_result(app: &tauri::AppHandle, text: &str) {
         .replace('\'', "\\'")
         .replace('\n', "\\n");
     eval_bubble(app, &format!("showResult('{escaped}')"));
-    resize_for_text(app, text);
+    // Keep passthrough while text injection is still targeting the previous app.
+    set_cursor_passthrough(app, true);
+    // JS side handles precise resize via Pretext measurement
+}
+
+pub fn enable_result_interaction(app: &tauri::AppHandle) {
+    set_cursor_passthrough(app, false);
 }
 
 pub fn set_error(app: &tauri::AppHandle, text: &str) {
@@ -126,13 +124,20 @@ pub fn set_error(app: &tauri::AppHandle, text: &str) {
         .replace('\'', "\\'")
         .replace('\n', "\\n");
     eval_bubble(app, &format!("showError('{escaped}')"));
-    set_bubble_size(app, 100.0);
+    set_cursor_passthrough(app, false);
+    // JS side handles resize
 }
 
 fn eval_bubble(app: &tauri::AppHandle, script: &str) {
     if let Some(win) = app.get_webview_window(BUBBLE_LABEL) {
         let webview: &Webview = win.as_ref();
         let _ = webview.eval(script);
+    }
+}
+
+fn set_cursor_passthrough(app: &tauri::AppHandle, ignore: bool) {
+    if let Some(win) = app.get_webview_window(BUBBLE_LABEL) {
+        let _ = win.set_ignore_cursor_events(ignore);
     }
 }
 

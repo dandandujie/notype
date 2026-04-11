@@ -42,9 +42,25 @@ pub struct ModelConfig {
     pub gemini_api_key: String,
     #[serde(default)]
     pub qwen_api_key: String,
+    #[serde(default)]
+    pub doubao_api_key: String,
+    #[serde(default = "default_doubao_base_url")]
+    pub doubao_base_url: String,
+    #[serde(default)]
+    pub doubao_official_app_key: String,
+    #[serde(default)]
+    pub doubao_official_access_key: String,
+    #[serde(default = "default_enable_doubao_postprocess")]
+    pub enable_doubao_postprocess: bool,
+    #[serde(default)]
+    pub doubao_postprocess_provider: DoubaoPostprocessProvider,
+    #[serde(default = "default_enable_doubao_realtime_ws")]
+    pub enable_doubao_realtime_ws: bool,
+    #[serde(default = "default_doubao_ime_credential_path")]
+    pub doubao_ime_credential_path: String,
     #[serde(default = "default_model_name")]
     pub model_name: String,
-    /// Legacy field: migrated into gemini/qwen key on load.
+    /// Legacy field: migrated into provider-specific key on load.
     #[serde(default, skip_serializing)]
     api_key: String,
 }
@@ -54,6 +70,7 @@ pub enum Provider {
     #[default]
     Gemini,
     Qwen,
+    Doubao,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -63,11 +80,36 @@ pub enum InputMode {
     Clipboard,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DoubaoPostprocessProvider {
+    #[default]
+    Auto,
+    Qwen,
+    Gemini,
+}
+
 fn default_hotkey() -> String {
     "Ctrl+.".into()
 }
 fn default_model_name() -> String {
     "gemini-3-flash-preview".into()
+}
+
+fn default_doubao_base_url() -> String {
+    "http://127.0.0.1:8000".into()
+}
+
+fn default_enable_doubao_postprocess() -> bool {
+    true
+}
+
+fn default_enable_doubao_realtime_ws() -> bool {
+    true
+}
+
+fn default_doubao_ime_credential_path() -> String {
+    "~/.config/doubaoime-asr/credentials.json".into()
 }
 
 impl Default for GeneralConfig {
@@ -161,6 +203,14 @@ impl Default for ModelConfig {
             provider: Provider::default(),
             gemini_api_key: String::new(),
             qwen_api_key: String::new(),
+            doubao_api_key: String::new(),
+            doubao_base_url: default_doubao_base_url(),
+            doubao_official_app_key: String::new(),
+            doubao_official_access_key: String::new(),
+            enable_doubao_postprocess: default_enable_doubao_postprocess(),
+            doubao_postprocess_provider: DoubaoPostprocessProvider::Auto,
+            enable_doubao_realtime_ws: default_enable_doubao_realtime_ws(),
+            doubao_ime_credential_path: default_doubao_ime_credential_path(),
             model_name: default_model_name(),
             api_key: String::new(),
         }
@@ -173,6 +223,37 @@ impl ModelConfig {
         match self.provider {
             Provider::Gemini => &self.gemini_api_key,
             Provider::Qwen => &self.qwen_api_key,
+            Provider::Doubao => &self.doubao_api_key,
+        }
+    }
+
+    pub fn is_doubao_official_model(&self) -> bool {
+        let name = self.model_name.trim().to_lowercase();
+        matches!(
+            name.as_str(),
+            "doubao-asr-official"
+                | "doubao-asr-official-standard"
+                | "doubao-asr-official-flash"
+                | "official"
+                | "official-standard"
+                | "official-flash"
+                | "standard"
+                | "flash"
+        )
+    }
+
+    pub fn has_required_credentials(&self) -> bool {
+        match self.provider {
+            Provider::Gemini => !self.gemini_api_key.is_empty(),
+            Provider::Qwen => !self.qwen_api_key.is_empty(),
+            Provider::Doubao => {
+                if self.is_doubao_official_model() {
+                    !self.doubao_official_app_key.is_empty()
+                        && !self.doubao_official_access_key.is_empty()
+                } else {
+                    !self.doubao_base_url.trim().is_empty()
+                }
+            }
         }
     }
 }
@@ -255,6 +336,11 @@ fn migrate_legacy_key(config: &mut AppConfig) {
                 config.model.qwen_api_key = std::mem::take(&mut config.model.api_key);
             }
         }
+        Provider::Doubao => {
+            if config.model.doubao_api_key.is_empty() {
+                config.model.doubao_api_key = std::mem::take(&mut config.model.api_key);
+            }
+        }
     }
     config.model.api_key.clear();
 }
@@ -274,22 +360,12 @@ fn migrate_model_names(config: &mut AppConfig) {
 }
 
 fn apply_env_overrides(config: &mut AppConfig) {
-    // NOTYPE_API_KEY overrides the current provider's key
-    if let Ok(key) = std::env::var("NOTYPE_API_KEY") {
-        if !key.is_empty() {
-            tracing::info!("Using API key from NOTYPE_API_KEY env var");
-            match config.model.provider {
-                Provider::Gemini => config.model.gemini_api_key = key,
-                Provider::Qwen => config.model.qwen_api_key = key,
-            }
-        }
-    }
-
-    // NOTYPE_PROVIDER: "gemini" or "qwen"
+    // NOTYPE_PROVIDER: "gemini" or "qwen" or "doubao"
     if let Ok(provider) = std::env::var("NOTYPE_PROVIDER") {
         match provider.to_lowercase().as_str() {
             "gemini" => config.model.provider = Provider::Gemini,
             "qwen" => config.model.provider = Provider::Qwen,
+            "doubao" => config.model.provider = Provider::Doubao,
             _ => tracing::warn!(
                 provider = %provider,
                 "Unknown provider in NOTYPE_PROVIDER, ignoring"
@@ -297,10 +373,90 @@ fn apply_env_overrides(config: &mut AppConfig) {
         }
     }
 
+    // NOTYPE_API_KEY overrides the current provider's key
+    if let Ok(key) = std::env::var("NOTYPE_API_KEY") {
+        if !key.is_empty() {
+            tracing::info!("Using API key from NOTYPE_API_KEY env var");
+            match config.model.provider {
+                Provider::Gemini => config.model.gemini_api_key = key,
+                Provider::Qwen => config.model.qwen_api_key = key,
+                Provider::Doubao => config.model.doubao_api_key = key,
+            }
+        }
+    }
+
     // NOTYPE_MODEL overrides model name
     if let Ok(model) = std::env::var("NOTYPE_MODEL") {
         if !model.is_empty() {
             config.model.model_name = model;
+        }
+    }
+
+    if let Ok(url) = std::env::var("NOTYPE_DOUBAO_BASE_URL") {
+        if !url.is_empty() {
+            config.model.doubao_base_url = url;
+        }
+    }
+
+    if let Ok(key) = std::env::var("NOTYPE_DOUBAO_API_KEY") {
+        if !key.is_empty() {
+            config.model.doubao_api_key = key;
+        }
+    }
+
+    if let Ok(key) = std::env::var("NOTYPE_DOUBAO_OFFICIAL_APP_KEY") {
+        if !key.is_empty() {
+            config.model.doubao_official_app_key = key;
+        }
+    }
+
+    if let Ok(key) = std::env::var("NOTYPE_DOUBAO_OFFICIAL_ACCESS_KEY") {
+        if !key.is_empty() {
+            config.model.doubao_official_access_key = key;
+        }
+    }
+
+    if let Ok(v) = std::env::var("NOTYPE_DOUBAO_POSTPROCESS") {
+        let normalized = v.trim().to_lowercase();
+        match normalized.as_str() {
+            "1" | "true" | "yes" | "on" => config.model.enable_doubao_postprocess = true,
+            "0" | "false" | "no" | "off" => config.model.enable_doubao_postprocess = false,
+            _ => tracing::warn!(
+                value = %v,
+                "Unknown NOTYPE_DOUBAO_POSTPROCESS value, expected true/false"
+            ),
+        }
+    }
+
+    if let Ok(v) = std::env::var("NOTYPE_DOUBAO_POSTPROCESS_PROVIDER") {
+        match v.trim().to_lowercase().as_str() {
+            "auto" => config.model.doubao_postprocess_provider = DoubaoPostprocessProvider::Auto,
+            "qwen" => config.model.doubao_postprocess_provider = DoubaoPostprocessProvider::Qwen,
+            "gemini" => {
+                config.model.doubao_postprocess_provider = DoubaoPostprocessProvider::Gemini
+            }
+            _ => tracing::warn!(
+                value = %v,
+                "Unknown NOTYPE_DOUBAO_POSTPROCESS_PROVIDER value, expected auto/qwen/gemini"
+            ),
+        }
+    }
+
+    if let Ok(v) = std::env::var("NOTYPE_DOUBAO_REALTIME_WS") {
+        let normalized = v.trim().to_lowercase();
+        match normalized.as_str() {
+            "1" | "true" | "yes" | "on" => config.model.enable_doubao_realtime_ws = true,
+            "0" | "false" | "no" | "off" => config.model.enable_doubao_realtime_ws = false,
+            _ => tracing::warn!(
+                value = %v,
+                "Unknown NOTYPE_DOUBAO_REALTIME_WS value, expected true/false"
+            ),
+        }
+    }
+
+    if let Ok(v) = std::env::var("NOTYPE_DOUBAO_IME_CREDENTIAL_PATH") {
+        if !v.trim().is_empty() {
+            config.model.doubao_ime_credential_path = v;
         }
     }
 }
@@ -315,8 +471,21 @@ mod tests {
         assert_eq!(config.general.hotkey, "Ctrl+.");
         assert!(config.model.gemini_api_key.is_empty());
         assert!(config.model.qwen_api_key.is_empty());
+        assert!(config.model.doubao_api_key.is_empty());
+        assert_eq!(config.model.doubao_base_url, "http://127.0.0.1:8000");
+        assert!(config.model.enable_doubao_postprocess);
+        assert_eq!(
+            config.model.doubao_postprocess_provider,
+            DoubaoPostprocessProvider::Auto
+        );
+        assert!(config.model.enable_doubao_realtime_ws);
+        assert_eq!(
+            config.model.doubao_ime_credential_path,
+            "~/.config/doubaoime-asr/credentials.json"
+        );
         assert_eq!(config.model.active_api_key(), "");
         assert_eq!(config.model.model_name, "gemini-3-flash-preview");
+        assert!(!config.model.has_required_credentials());
     }
 
     #[test]

@@ -32,3 +32,4 @@ src-tauri/gen/
 # Environment
 .env
 .env.*
+.ace-tool/

@@ -61,6 +61,29 @@ impl VoiceRecognizer for QwenClient {
 }
 
 impl QwenClient {
+    pub async fn postprocess_text_stream(
+        &self,
+        system_prompt: String,
+        raw_text: String,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> Result<RecognitionResult> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": raw_text }
+            ],
+            "stream": true,
+            "temperature": 0.2,
+            "max_tokens": 8192
+        });
+
+        let url = format!("{API_BASE}/chat/completions");
+        tracing::debug!(model = %self.model, "Sending text post-process request to Qwen (streaming)");
+        let text = self.send_stream(&url, &body, Some(tx)).await?;
+        Ok(RecognitionResult { text })
+    }
+
     async fn do_recognize(
         &self,
         audio_data: Vec<u8>,

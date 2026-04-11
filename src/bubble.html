@@ -6,6 +6,8 @@
       * { margin: 0; padding: 0; box-sizing: border-box; }
 
       html, body {
+        width: 100%;
+        height: 100%;
         background: transparent;
         overflow: hidden;
         font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
@@ -17,6 +19,7 @@
         flex-direction: column;
         align-items: center;
         gap: 14px;
+        height: 100vh;
         padding: 10px 16px 16px;
       }
 
@@ -29,49 +32,39 @@
         box-shadow: 0 2px 24px rgba(0,0,0,0.08), 0 0 0 0.5px rgba(0,0,0,0.04);
         min-height: 48px;
         display: flex;
-        align-items: center;
+        flex-direction: column;
+        justify-content: center;
+        position: relative;
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
       }
 
-      .card-text {
-        font-size: 14.5px;
-        line-height: 1.65;
-        color: #1d1d1f;
-        white-space: pre-wrap;
-        word-break: break-word;
-        flex: 1;
+      .card-content {
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        min-height: 0;
       }
 
-      /* Blinking cursor for interim */
-      .card-text.interim::after {
-        content: '▍';
-        animation: blink 0.8s step-end infinite;
-        color: #999;
-        font-weight: 300;
+      .card.text-mode {
+        justify-content: flex-start;
       }
 
-      @keyframes blink {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0; }
+      .card.text-mode .card-content {
+        display: block;
+        height: 100%;
+        overflow-x: hidden;
+        overflow-y: auto;
       }
 
-      /* Fade-in for newly appearing text spans */
-      .fade-in {
-        animation: textFadeIn 0.4s ease-out both;
-      }
-
-      @keyframes textFadeIn {
-        from { opacity: 0; transform: translateY(4px); filter: blur(2px); }
-        to   { opacity: 1; transform: translateY(0);  filter: blur(0); }
-      }
-
-      /* Crossfade for final result replacing interim */
-      .crossfade {
-        animation: crossfade 0.35s ease-out both;
-      }
-
-      @keyframes crossfade {
-        from { opacity: 0.4; }
-        to   { opacity: 1; }
+      /* Canvas fills the card content area */
+      .card-content canvas {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        flex: 0 0 auto;
       }
 
       /* Typing dots */
@@ -110,6 +103,7 @@
         background: #1d1d1f;
         box-shadow: 0 4px 20px rgba(0,0,0,0.12);
         transition: opacity 0.3s ease;
+        flex-shrink: 0;
       }
 
       .waveform {
@@ -163,6 +157,36 @@
         50% { opacity: 0.6; }
       }
 
+      /* Copy button */
+      .copy-btn {
+        position: absolute;
+        top: 8px;
+        right: 10px;
+        width: 28px;
+        height: 28px;
+        border: none;
+        background: rgba(0,0,0,0.04);
+        border-radius: 8px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        opacity: 0;
+        transition: opacity 0.2s;
+        pointer-events: none;
+      }
+      .copy-btn.visible {
+        opacity: 0.6;
+        pointer-events: auto;
+      }
+      .copy-btn:hover { opacity: 1; background: rgba(0,0,0,0.08); }
+      .copy-btn svg { width: 15px; height: 15px; stroke: #666; fill: none; stroke-width: 1.6; }
+
+      /* Thin scrollbar for card overflow */
+      .card-content::-webkit-scrollbar { width: 4px; }
+      .card-content::-webkit-scrollbar-track { background: transparent; }
+      .card-content::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 2px; }
+
       .hidden { display: none !important; }
 
       @media (prefers-color-scheme: dark) {
@@ -170,10 +194,12 @@
           background: #2c2c2e;
           box-shadow: 0 2px 24px rgba(0,0,0,0.3), 0 0 0 0.5px rgba(255,255,255,0.06);
         }
-        .card-text { color: #f5f5f7; }
         .typing-dots i { background: #636366; }
         .pill { background: #f5f5f7; box-shadow: 0 4px 20px rgba(0,0,0,0.25); }
         .waveform i { background: #1d1d1f; }
+        .copy-btn { background: rgba(255,255,255,0.06); }
+        .copy-btn:hover { background: rgba(255,255,255,0.12); }
+        .copy-btn svg { stroke: #aaa; }
       }
     </style>
   </head>
@@ -181,8 +207,16 @@
   <body>
     <div class="container">
       <div class="card" id="card">
-        <div class="typing-dots" id="dots"><i></i><i></i><i></i></div>
-        <div class="card-text hidden" id="text"></div>
+        <div class="card-content" id="card-content">
+          <div class="typing-dots" id="dots"><i></i><i></i><i></i></div>
+          <canvas id="text-canvas" class="hidden"></canvas>
+        </div>
+        <button class="copy-btn" id="copy-btn" title="Copy as image">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+          </svg>
+        </button>
       </div>
       <div class="pill recording" id="pill">
         <span class="waveform">
@@ -191,91 +225,6 @@
       </div>
     </div>
 
-    <script>
-      var _prevText = '';
-
-      // Find longest common prefix between two strings
-      function _commonPrefix(a, b) {
-        var i = 0;
-        while (i < a.length && i < b.length && a[i] === b[i]) i++;
-        return i;
-      }
-
-      // Render text with fade-in on the new portion
-      function _renderWithFade(el, text, prevText) {
-        var prefixLen = _commonPrefix(prevText, text);
-        var stableText = text.slice(0, prefixLen);
-        var newText = text.slice(prefixLen);
-
-        if (newText.length === 0 && stableText === prevText) {
-          return; // no change
-        }
-
-        // Build innerHTML: stable part as text node + new part in fade-in span
-        el.innerHTML = '';
-        if (stableText) {
-          el.appendChild(document.createTextNode(stableText));
-        }
-        if (newText) {
-          var span = document.createElement('span');
-          span.className = 'fade-in';
-          span.textContent = newText;
-          el.appendChild(span);
-        }
-      }
-
-      // -- Public API called from Rust --
-
-      function showRecording() {
-        _prevText = '';
-        document.getElementById('dots').className = 'typing-dots';
-        var t = document.getElementById('text');
-        t.className = 'card-text hidden';
-        t.innerHTML = '';
-        document.getElementById('pill').className = 'pill recording';
-        document.getElementById('card').className = 'card';
-      }
-
-      function showRecognizing() {
-        var t = document.getElementById('text');
-        t.classList.remove('interim');
-        document.getElementById('pill').className = 'pill recognizing';
-      }
-
-      function showInterim(text) {
-        document.getElementById('dots').className = 'typing-dots hidden';
-        var t = document.getElementById('text');
-        t.className = 'card-text interim';
-        _renderWithFade(t, text, _prevText);
-        _prevText = text;
-      }
-
-      function showResult(text) {
-        document.getElementById('dots').className = 'typing-dots hidden';
-        var t = document.getElementById('text');
-
-        if (_prevText) {
-          // Had interim — crossfade transition from interim to final
-          t.className = 'card-text crossfade';
-          _renderWithFade(t, text, _prevText);
-        } else {
-          // No interim — full fade-in
-          t.className = 'card-text fade-in';
-          t.textContent = text;
-        }
-
-        _prevText = text;
-        document.getElementById('pill').className = 'pill hidden';
-      }
-
-      function showError(text) {
-        _prevText = '';
-        document.getElementById('dots').className = 'typing-dots hidden';
-        var t = document.getElementById('text');
-        t.className = 'card-text fade-in';
-        t.textContent = text;
-        document.getElementById('pill').className = 'pill hidden';
-      }
-    </script>
+    <script type="module" src="/src/bubble.ts"></script>
   </body>
 </html>

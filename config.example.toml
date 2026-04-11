@@ -7,9 +7,28 @@ hotkey = "Ctrl+."
 input_mode = "Keyboard"
 
 [model]
-provider = "qwen"     # "gemini" or "qwen"
+provider = "qwen"     # "gemini" or "qwen" or "doubao"
 model_name = "qwen3.5-omni-flash"
 
 # Each provider has its own API key
 gemini_api_key = ""   # https://ai.google.dev
 qwen_api_key = ""     # https://dashscope.aliyuncs.com
+
+# Doubao ASR (asr2api gateway mode)
+doubao_base_url = "http://127.0.0.1:8000"
+doubao_api_key = ""   # Optional (OpenTypeless / doubao-asr-api gateway key)
+
+# Doubao official file ASR mode
+doubao_official_app_key = ""
+doubao_official_access_key = ""
+
+# Optional LLM post-process keys when provider = doubao (recommended for semantic cleanup)
+# Set false to run ASR-only (skip semantic cleanup step).
+enable_doubao_postprocess = true
+# "auto" | "qwen" | "gemini"
+doubao_postprocess_provider = "auto"
+# Auto mode uses qwen first, then gemini if qwen key is empty.
+
+# Realtime preview via doubaoime-asr websocket bridge (while holding hotkey)
+enable_doubao_realtime_ws = true
+doubao_ime_credential_path = "~/.config/doubaoime-asr/credentials.json"
