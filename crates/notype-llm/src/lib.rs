@@ -1,10 +1,11 @@
 //! LLM API client module for NoType.
 //!
-//! Abstracts multimodal/ASR providers (Gemini, Qwen, Doubao) behind a unified
+//! Abstracts multimodal/ASR providers (Gemini, Qwen, MiMo, Doubao) behind a unified
 //! trait for voice-to-text recognition.
 
 pub mod doubao;
 pub mod gemini;
+pub mod mimo;
 pub mod qwen;
 
 use std::future::Future;
@@ -60,12 +61,14 @@ pub trait VoiceRecognizer: Send + Sync {
 pub enum Provider {
     Gemini,
     Qwen,
+    Mimo,
     Doubao,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RecognizerOptions {
     pub model: Option<String>,
+    pub mimo_base_url: Option<String>,
     pub doubao_base_url: Option<String>,
     pub doubao_official_app_key: Option<String>,
     pub doubao_official_access_key: Option<String>,
@@ -80,6 +83,11 @@ pub fn create_recognizer(
     match provider {
         Provider::Gemini => Box::new(gemini::GeminiClient::new(api_key, options.model)),
         Provider::Qwen => Box::new(qwen::QwenClient::new(api_key, options.model)),
+        Provider::Mimo => Box::new(mimo::MimoClient::new(
+            api_key,
+            options.model,
+            options.mimo_base_url,
+        )),
         Provider::Doubao => Box::new(doubao::DoubaoClient::new(
             api_key,
             options.model,
@@ -91,7 +99,7 @@ pub fn create_recognizer(
 }
 
 /// Stream post-processing for ASR raw text.
-/// Currently supported providers: Gemini, Qwen.
+/// Currently supported providers: Gemini, Qwen, MiMo.
 pub async fn postprocess_text_stream(
     provider: Provider,
     api_key: String,
@@ -109,6 +117,12 @@ pub async fn postprocess_text_stream(
         }
         Provider::Qwen => {
             let client = qwen::QwenClient::new(api_key, model);
+            client
+                .postprocess_text_stream(system_prompt, raw_text, tx)
+                .await
+        }
+        Provider::Mimo => {
+            let client = mimo::MimoClient::new(api_key, model, None);
             client
                 .postprocess_text_stream(system_prompt, raw_text, tx)
                 .await

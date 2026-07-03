@@ -1,6 +1,6 @@
 [package]
 name = "notype-llm"
-description = "LLM API client for voice recognition (Gemini, Qwen)"
+description = "LLM API client for voice recognition (Gemini, Qwen, MiMo)"
 version.workspace = true
 edition.workspace = true
 

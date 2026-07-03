@@ -1,0 +1,311 @@
+//! 小米 MiMo API client for voice recognition.
+//!
+//! MiMo 提供 OpenAI-compatible chat/completions 入口，音频通过 input_audio 传入。
+
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+
+use std::future::Future;
+use std::pin::Pin;
+
+use tokio::sync::mpsc;
+
+use crate::{LlmError, RecognitionResult, Result, VoiceRecognizer};
+
+const DEFAULT_MODEL: &str = "mimo-v2.5-asr";
+const DEFAULT_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
+
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const MAX_RETRIES: u32 = 2;
+
+pub struct MimoClient {
+    api_key: String,
+    model: String,
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl MimoClient {
+    pub fn new(api_key: String, model: Option<String>, base_url: Option<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_default();
+        Self {
+            api_key,
+            model: model.unwrap_or_else(|| DEFAULT_MODEL.into()),
+            base_url: normalize_base_url(base_url),
+            client,
+        }
+    }
+}
+
+impl VoiceRecognizer for MimoClient {
+    fn recognize(
+        &self,
+        audio_data: Vec<u8>,
+        mime_type: String,
+        system_prompt: String,
+    ) -> Pin<Box<dyn Future<Output = Result<RecognitionResult>> + Send + '_>> {
+        Box::pin(self.do_recognize(audio_data, mime_type, system_prompt, None))
+    }
+
+    fn recognize_stream(
+        &self,
+        audio_data: Vec<u8>,
+        mime_type: String,
+        system_prompt: String,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<RecognitionResult>> + Send + '_>> {
+        Box::pin(self.do_recognize(audio_data, mime_type, system_prompt, Some(tx)))
+    }
+}
+
+impl MimoClient {
+    pub async fn postprocess_text_stream(
+        &self,
+        system_prompt: String,
+        raw_text: String,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> Result<RecognitionResult> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": raw_text }
+            ],
+            "stream": true,
+            "temperature": 0.2,
+            "max_completion_tokens": 8192
+        });
+
+        let url = self.chat_completions_url();
+        tracing::debug!(model = %self.model, "Sending text post-process request to MiMo (streaming)");
+        let text = self.send_stream(&url, &body, Some(tx)).await?;
+        Ok(RecognitionResult { text })
+    }
+
+    async fn do_recognize(
+        &self,
+        audio_data: Vec<u8>,
+        mime_type: String,
+        system_prompt: String,
+        tx: Option<mpsc::UnboundedSender<String>>,
+    ) -> Result<RecognitionResult> {
+        let audio_base64 = BASE64.encode(&audio_data);
+        let audio_data_url = format!("data:{mime_type};base64,{audio_base64}");
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": { "data": audio_data_url }
+                        },
+                        {
+                            "type": "text",
+                            "text": "Transcribe this audio completely from start to end. Do not omit, summarize, or skip any part. Output only the transcription."
+                        }
+                    ]
+                }
+            ],
+            "stream": true,
+            "temperature": 0.0,
+            "max_completion_tokens": 8192
+        });
+
+        let url = self.chat_completions_url();
+        tracing::debug!(model = %self.model, audio_bytes = audio_data.len(), "Sending to MiMo (streaming)");
+
+        let text = self.send_stream(&url, &body, tx).await?;
+
+        if text.is_empty() {
+            tracing::warn!("MiMo returned empty transcription");
+        } else {
+            tracing::info!(chars = text.len(), "MiMo transcription received");
+        }
+
+        Ok(RecognitionResult { text })
+    }
+
+    fn chat_completions_url(&self) -> String {
+        format!("{}/chat/completions", self.base_url)
+    }
+
+    async fn send_stream(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        tx: Option<mpsc::UnboundedSender<String>>,
+    ) -> Result<String> {
+        let mut last_err = LlmError::RequestFailed("no attempts".into());
+
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = std::time::Duration::from_millis(500 * u64::from(attempt));
+                tracing::warn!(attempt, "Retrying MiMo request after {delay:?}");
+                tokio::time::sleep(delay).await;
+            }
+
+            let result = self
+                .client
+                .post(url)
+                .header("api-key", &self.api_key)
+                .bearer_auth(&self.api_key)
+                .json(body)
+                .send()
+                .await;
+
+            match result {
+                Ok(response) => {
+                    let status = response.status();
+                    if status == reqwest::StatusCode::UNAUTHORIZED
+                        || status == reqwest::StatusCode::FORBIDDEN
+                    {
+                        return Err(LlmError::InvalidApiKey);
+                    }
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                    {
+                        last_err = LlmError::RequestFailed(format!("HTTP {status}"));
+                        continue;
+                    }
+                    if !status.is_success() {
+                        let body_text = response.text().await.unwrap_or_default();
+                        return Err(LlmError::RequestFailed(body_text));
+                    }
+                    return self.read_sse_stream(response, &tx).await;
+                }
+                Err(e) if e.is_timeout() || e.is_connect() => {
+                    last_err = LlmError::RequestFailed(e.to_string());
+                    continue;
+                }
+                Err(e) => return Err(LlmError::HttpError(e)),
+            }
+        }
+
+        Err(last_err)
+    }
+
+    /// 解析 OpenAI-compatible SSE，同时兼容 MiMo 可能返回的 reasoning_content。
+    async fn read_sse_stream(
+        &self,
+        response: reqwest::Response,
+        tx: &Option<mpsc::UnboundedSender<String>>,
+    ) -> Result<String> {
+        use futures_util::StreamExt;
+
+        let mut full_text = String::new();
+        let mut raw_buf: Vec<u8> = Vec::new();
+        let mut stream = response.bytes_stream();
+
+        let mut chunk_idx: u32 = 0;
+        while let Some(chunk_result) = stream.next().await {
+            let bytes = chunk_result.map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+            chunk_idx += 1;
+            tracing::debug!(
+                chunk_idx,
+                bytes = bytes.len(),
+                "MiMo SSE network chunk received"
+            );
+            raw_buf.extend_from_slice(&bytes);
+
+            while let Some(newline_pos) = raw_buf.iter().position(|&b| b == b'\n') {
+                let line_bytes = raw_buf[..newline_pos].to_vec();
+                raw_buf = raw_buf[newline_pos + 1..].to_vec();
+
+                let line = String::from_utf8(line_bytes)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                if line == "data: [DONE]" {
+                    return Ok(full_text.trim().to_string());
+                }
+
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+
+                let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+
+                if let Some(error) = chunk.get("error") {
+                    let msg = error
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown error");
+                    return Err(LlmError::RequestFailed(msg.into()));
+                }
+
+                if let Some(reason) = chunk
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(|v| v.as_str())
+                {
+                    tracing::info!(finish_reason = %reason, "MiMo stream finished");
+                }
+
+                for pointer in [
+                    "/choices/0/delta/content",
+                    "/choices/0/delta/reasoning_content",
+                    "/choices/0/message/content",
+                    "/choices/0/message/reasoning_content",
+                ] {
+                    if let Some(content) = chunk.pointer(pointer).and_then(|v| v.as_str()) {
+                        if !content.is_empty() {
+                            tracing::info!(chunk = %content, total_len = full_text.len() + content.len(), "MiMo stream delta");
+                            full_text.push_str(content);
+                            if let Some(tx) = tx {
+                                let _ = tx.send(content.to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(full_text.trim().to_string())
+    }
+}
+
+fn normalize_base_url(base_url: Option<String>) -> String {
+    base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_BASE_URL)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_model_and_base_url() {
+        let client = MimoClient::new("test-key".into(), None, None);
+        assert_eq!(client.model, "mimo-v2.5-asr");
+        assert_eq!(client.base_url, "https://api.xiaomimimo.com/v1");
+    }
+
+    #[test]
+    fn test_custom_model_and_base_url() {
+        let client = MimoClient::new(
+            "test-key".into(),
+            Some("mimo-v2.5-pro".into()),
+            Some("https://example.test/v1/".into()),
+        );
+        assert_eq!(client.model, "mimo-v2.5-pro");
+        assert_eq!(client.base_url, "https://example.test/v1");
+    }
+}
