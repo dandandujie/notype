@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+arboard = "3"
 enigo = "0.3"
 thiserror = { workspace = true }
 tracing = { workspace = true }

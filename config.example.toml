@@ -4,15 +4,22 @@
 
 [general]
 hotkey = "Ctrl+."
-input_mode = "Keyboard"
+# "keyboard" = 模拟键盘逐字输入; "clipboard" = 剪贴板粘贴（长文本更快，但会覆盖剪贴板）
+input_mode = "keyboard"
+# 指定麦克风设备名，留空使用系统默认
+audio_device = ""
+# 键盘输入完成后是否同时把结果复制到剪贴板
+auto_copy = false
 
 [model]
-provider = "qwen"     # "gemini" or "qwen" or "doubao"
+provider = "qwen"     # "gemini" or "qwen" or "mimo" or "doubao"
 model_name = "qwen3.5-omni-flash"
 
 # Each provider has its own API key
 gemini_api_key = ""   # https://ai.google.dev
 qwen_api_key = ""     # https://dashscope.aliyuncs.com
+mimo_api_key = ""     # https://platform.xiaomimimo.com
+mimo_base_url = "https://api.xiaomimimo.com/v1"
 
 # Doubao ASR (asr2api gateway mode)
 doubao_base_url = "http://127.0.0.1:8000"

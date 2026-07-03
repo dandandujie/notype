@@ -3,16 +3,20 @@
 一个轻量的跨平台语音输入工具。按住快捷键说话，松开后文字直接打到光标位置。
 
 现在支持两条识别链路：
-- LLM 多模态识别（Gemini / Qwen）
+- LLM 多模态识别（Gemini / Qwen / Xiaomi MiMo）
 - Doubao ASR（asr2api 网关模式 + 官方 API 模式）
 
 ## 功能
 
 - 按住快捷键说话，松开后文字自动输入到当前光标位置
-- 悬浮气泡跟随鼠标，实时显示录音/识别状态和转写结果
+- 主窗口点按录音键即可窗口内听写，结果自动复制到剪贴板（Esc 取消）
+- 悬浮气泡跟随鼠标，实时显示录音/识别状态和转写结果，支持复制文本/图片
+- 转写历史：最近 200 条本地保存，可复制、删除、清空
+- 两种输入方式：模拟键盘逐字输入 / 剪贴板粘贴（长文本更快）
+- 麦克风设备可选择，开机自启动可开关
 - 可编辑的提示词系统：角色指令 / 转录规则 / 专有词汇，在 app 里直接改
 - 内置自动分段、数字格式化、符号口令、技术词汇校正等规则
-- 系统托盘常驻，关闭窗口只是隐藏，不退出
+- 系统托盘常驻（含「开始/停止听写」入口），关闭窗口只是隐藏，不退出
 - 快捷键可自定义（macOS 支持 Command 键）
 
 ## 支持的模型
@@ -21,6 +25,10 @@
 |------|------|------|
 | 阿里 | qwen3.5-omni-flash | 推荐日常使用，中文效果好，速度快 |
 | 阿里 | qwen3.5-omni-plus | 质量最高，适合长段落和复杂场景 |
+| 小米 | mimo-v2.5-asr | MiMo ASR 系列模型 |
+| 小米 | mimo-v2.5 | MiMo 音频理解模型 |
+| 小米 | mimo-v2-omni | MiMo 多模态模型 |
+| 小米 | mimo-v2.5-pro | MiMo Pro 模型，具体音频能力以服务端为准 |
 | Google | gemini-3-flash | Gemini 3 系列，多语言 |
 | Google | gemini-3.1-flash-lite | 更便宜，适合高频使用 |
 | 豆包 | doubao-asr | 通过 asr2api 网关接入 |
@@ -37,6 +45,7 @@
 2. 启动后设置窗口自动弹出，填入 API Key
    - Qwen：去 [百炼控制台](https://dashscope.console.aliyun.com/) 申请
    - Gemini：去 [Google AI Studio](https://ai.google.dev) 申请
+   - MiMo：去 [小米 MiMo API 开放平台](https://platform.xiaomimimo.com) 申请
    - Doubao asr2api：填写网关地址（默认 `http://127.0.0.1:8000`），可选网关 API Key
    - Doubao 官方：填写 `App Key` 和 `Access Key`
    - 使用 Doubao 时建议同时配置 Qwen 或 Gemini Key，用于第二阶段 LLM 实时后处理（未配置则退化为纯 ASR）
@@ -60,7 +69,7 @@
 
 ```
 按住快捷键 → 麦克风实时分片录音（16kHz WAV）
-  → ASR（Doubao / Gemini / Qwen）持续输出中间转写
+  → ASR（Doubao / Gemini / Qwen / MiMo）持续输出中间转写
   → （Doubao 模式）中间转写进入 LLM 实时后处理（语义修正/格式化/改口清理）
   → 松开按键后执行最终识别并输入到当前窗口
 ```
@@ -71,8 +80,12 @@
 
 ```bash
 export NOTYPE_API_KEY="your-key"
-export NOTYPE_PROVIDER="qwen"   # 或 gemini / doubao
+export NOTYPE_PROVIDER="qwen"   # 或 gemini / mimo / doubao
 export NOTYPE_MODEL="qwen3.5-omni-flash"
+
+# MiMo 可选配置
+export NOTYPE_MIMO_API_KEY=""
+export NOTYPE_MIMO_BASE_URL="https://api.xiaomimimo.com/v1"
 
 # Doubao 可选配置
 export NOTYPE_DOUBAO_BASE_URL="http://127.0.0.1:8000"
@@ -90,6 +103,8 @@ export NOTYPE_DOUBAO_PYTHON="python3"
 配置文件位置：
 - macOS：`~/Library/Application Support/notype/config.toml`
 - Windows：`%APPDATA%/notype/config.toml`
+
+转写历史保存在同目录的 `history.json`（最多 200 条，可在设置页一键打开该文件夹）。
 
 参考 [config.example.toml](config.example.toml)。
 
@@ -118,7 +133,7 @@ src-tauri/          Tauri 主应用（托盘、快捷键、气泡窗口）
 src/                前端设置界面 + 气泡 UI（TypeScript）
 crates/
 ├── notype-audio/   录音（cpal）+ WAV 编码（hound）
-├── notype-llm/     Gemini / Qwen / Doubao 识别客户端
+├── notype-llm/     Gemini / Qwen / MiMo / Doubao 识别客户端
 ├── notype-input/   键盘模拟（enigo）
 └── notype-config/  配置管理 + 提示词系统
 ```

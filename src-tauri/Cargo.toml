@@ -30,3 +30,4 @@ notype-config = { path = "../crates/notype-config" }
 
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2"

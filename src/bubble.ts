@@ -543,8 +543,25 @@ async function copyAsImage() {
   }
 }
 
-// Set up copy button
+async function copyAsText() {
+  if (!currentText) return;
+  try {
+    await navigator.clipboard.writeText(currentText);
+    const btn = $("copy-text-btn");
+    btn.style.opacity = "1";
+    btn.title = "已复制";
+    setTimeout(() => {
+      btn.style.opacity = "";
+      btn.title = "复制文本";
+    }, 1500);
+  } catch (e) {
+    console.error("Failed to copy text:", e);
+  }
+}
+
+// Set up copy buttons
 $("copy-btn").addEventListener("click", copyAsImage);
+$("copy-text-btn").addEventListener("click", copyAsText);
 
 // -- Public API --
 
@@ -561,7 +578,7 @@ window.showRecording = function () {
 
   $("dots").className = "typing-dots";
   getCanvas().className = "hidden";
-  $("copy-btn").classList.remove("visible");
+  $("card-actions").classList.remove("visible");
   $("pill").className = "pill recording";
   $("card").className = "card";
   $("card-content").scrollTop = 0;
@@ -578,7 +595,7 @@ window.showRecognizing = function () {
 window.showInterim = function (text: string) {
   $("dots").className = "typing-dots hidden";
   getCanvas().className = "";
-  $("copy-btn").classList.remove("visible");
+  $("card-actions").classList.remove("visible");
   $("card").className = "card text-mode";
 
   isInterim = true;
@@ -615,7 +632,7 @@ window.showResult = function (text: string) {
   });
 
   // Show copy button after result
-  $("copy-btn").classList.add("visible");
+  $("card-actions").classList.add("visible");
 };
 
 window.showError = function (text: string) {
@@ -630,5 +647,5 @@ window.showError = function (text: string) {
   currentText = text;
 
   startAnimation(text, 0, false);
-  $("copy-btn").classList.remove("visible");
+  $("card-actions").classList.remove("visible");
 };

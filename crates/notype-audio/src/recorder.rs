@@ -14,6 +14,7 @@ use crate::{device, encoder, AudioData, AudioError, AudioPcmSlice, AudioSlice, R
 
 enum Command {
     Start,
+    SetDevice(Option<String>),
     Stop(mpsc::Sender<Result<AudioData>>),
     Snapshot(mpsc::Sender<Result<AudioData>>),
     SnapshotFrom {
@@ -56,6 +57,12 @@ impl Recorder {
 
     pub fn is_recording(&self) -> bool {
         self.recording.load(Ordering::Relaxed)
+    }
+
+    /// Switch the target input device. Takes effect on the next `start()`;
+    /// an in-flight recording keeps its current stream.
+    pub fn set_device(&self, device_name: Option<String>) {
+        let _ = self.cmd_tx.send(Command::SetDevice(device_name));
     }
 
     /// Start capturing audio from the microphone.
@@ -133,6 +140,7 @@ fn audio_thread(
     recording: Arc<AtomicBool>,
     device_name: Option<String>,
 ) {
+    let mut device_name = device_name;
     let mut stream: Option<cpal::Stream> = None;
     let buffer: Arc<std::sync::Mutex<Vec<f32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut sample_rate: u32 = 16000;
@@ -140,8 +148,22 @@ fn audio_thread(
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
+            Command::SetDevice(name) => {
+                tracing::info!(device = ?name, "Audio input device updated");
+                device_name = name;
+            }
             Command::Start => {
-                let device = match device::get_device(device_name.as_deref()) {
+                // GOTCHA: fall back to the default device if the named one unplugged,
+                // instead of failing the whole recording session.
+                let device = match device::get_device(device_name.as_deref())
+                    .or_else(|e| {
+                        if device_name.is_some() {
+                            tracing::warn!("Named device unavailable ({e}), falling back to default");
+                            device::get_device(None)
+                        } else {
+                            Err(e)
+                        }
+                    }) {
                     Ok(d) => d,
                     Err(e) => {
                         tracing::error!("Failed to get audio device: {e}");

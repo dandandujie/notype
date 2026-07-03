@@ -7,9 +7,10 @@ use tauri::{
 const TRAY_ID: &str = "notype-tray";
 
 pub fn create_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
-    let quit = MenuItem::with_id(app, "quit", "Quit NoType", true, None::<&str>)?;
-    let show = MenuItem::with_id(app, "show", "Show Settings", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let show = MenuItem::with_id(app, "show", "打开 NoType", true, None::<&str>)?;
+    let dictate = MenuItem::with_id(app, "dictate", "开始 / 停止听写", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &dictate, &quit])?;
 
     let icon = tauri::include_image!("icons/icon.png");
 
@@ -23,6 +24,20 @@ pub fn create_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
                 app.exit(0);
             }
             "show" => show_main_window(app),
+            "dictate" => {
+                let state = app.state::<crate::AppState>();
+                if state.recorder.is_recording() {
+                    if let Err(e) = crate::stop_capture(app) {
+                        tracing::warn!("Tray stop dictation failed: {e}");
+                    }
+                } else {
+                    // Open the window first so the user sees the live transcript.
+                    show_main_window(app);
+                    if let Err(e) = crate::start_capture(app, true) {
+                        tracing::warn!("Tray start dictation failed: {e}");
+                    }
+                }
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

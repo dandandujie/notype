@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+pub mod history;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
@@ -21,6 +23,12 @@ pub struct GeneralConfig {
     pub hotkey: String,
     #[serde(default)]
     pub input_mode: InputMode,
+    /// Preferred microphone device name. Empty string = system default.
+    #[serde(default)]
+    pub audio_device: String,
+    /// Also copy the final text to the clipboard after typing it.
+    #[serde(default)]
+    pub auto_copy: bool,
 }
 
 /// Prompt configuration — three composable modules.
@@ -42,6 +50,10 @@ pub struct ModelConfig {
     pub gemini_api_key: String,
     #[serde(default)]
     pub qwen_api_key: String,
+    #[serde(default)]
+    pub mimo_api_key: String,
+    #[serde(default = "default_mimo_base_url")]
+    pub mimo_base_url: String,
     #[serde(default)]
     pub doubao_api_key: String,
     #[serde(default = "default_doubao_base_url")]
@@ -67,16 +79,24 @@ pub struct ModelConfig {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub enum Provider {
+    #[serde(rename = "gemini", alias = "Gemini")]
     #[default]
     Gemini,
+    #[serde(rename = "qwen", alias = "Qwen")]
     Qwen,
+    #[serde(rename = "mimo", alias = "Mimo", alias = "MiMo", alias = "xiaomi")]
+    Mimo,
+    #[serde(rename = "doubao", alias = "Doubao")]
     Doubao,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum InputMode {
     #[default]
+    #[serde(alias = "Keyboard")]
     Keyboard,
+    #[serde(alias = "Clipboard")]
     Clipboard,
 }
 
@@ -100,6 +120,10 @@ fn default_doubao_base_url() -> String {
     "http://127.0.0.1:8000".into()
 }
 
+fn default_mimo_base_url() -> String {
+    "https://api.xiaomimimo.com/v1".into()
+}
+
 fn default_enable_doubao_postprocess() -> bool {
     true
 }
@@ -117,6 +141,8 @@ impl Default for GeneralConfig {
         Self {
             hotkey: default_hotkey(),
             input_mode: InputMode::default(),
+            audio_device: String::new(),
+            auto_copy: false,
         }
     }
 }
@@ -203,6 +229,8 @@ impl Default for ModelConfig {
             provider: Provider::default(),
             gemini_api_key: String::new(),
             qwen_api_key: String::new(),
+            mimo_api_key: String::new(),
+            mimo_base_url: default_mimo_base_url(),
             doubao_api_key: String::new(),
             doubao_base_url: default_doubao_base_url(),
             doubao_official_app_key: String::new(),
@@ -223,6 +251,7 @@ impl ModelConfig {
         match self.provider {
             Provider::Gemini => &self.gemini_api_key,
             Provider::Qwen => &self.qwen_api_key,
+            Provider::Mimo => &self.mimo_api_key,
             Provider::Doubao => &self.doubao_api_key,
         }
     }
@@ -246,6 +275,9 @@ impl ModelConfig {
         match self.provider {
             Provider::Gemini => !self.gemini_api_key.is_empty(),
             Provider::Qwen => !self.qwen_api_key.is_empty(),
+            Provider::Mimo => {
+                !self.mimo_api_key.is_empty() && !self.mimo_base_url.trim().is_empty()
+            }
             Provider::Doubao => {
                 if self.is_doubao_official_model() {
                     !self.doubao_official_app_key.is_empty()
@@ -336,6 +368,11 @@ fn migrate_legacy_key(config: &mut AppConfig) {
                 config.model.qwen_api_key = std::mem::take(&mut config.model.api_key);
             }
         }
+        Provider::Mimo => {
+            if config.model.mimo_api_key.is_empty() {
+                config.model.mimo_api_key = std::mem::take(&mut config.model.api_key);
+            }
+        }
         Provider::Doubao => {
             if config.model.doubao_api_key.is_empty() {
                 config.model.doubao_api_key = std::mem::take(&mut config.model.api_key);
@@ -360,11 +397,12 @@ fn migrate_model_names(config: &mut AppConfig) {
 }
 
 fn apply_env_overrides(config: &mut AppConfig) {
-    // NOTYPE_PROVIDER: "gemini" or "qwen" or "doubao"
+    // NOTYPE_PROVIDER: "gemini" or "qwen" or "mimo" or "doubao"
     if let Ok(provider) = std::env::var("NOTYPE_PROVIDER") {
         match provider.to_lowercase().as_str() {
             "gemini" => config.model.provider = Provider::Gemini,
             "qwen" => config.model.provider = Provider::Qwen,
+            "mimo" | "xiaomi" => config.model.provider = Provider::Mimo,
             "doubao" => config.model.provider = Provider::Doubao,
             _ => tracing::warn!(
                 provider = %provider,
@@ -380,6 +418,7 @@ fn apply_env_overrides(config: &mut AppConfig) {
             match config.model.provider {
                 Provider::Gemini => config.model.gemini_api_key = key,
                 Provider::Qwen => config.model.qwen_api_key = key,
+                Provider::Mimo => config.model.mimo_api_key = key,
                 Provider::Doubao => config.model.doubao_api_key = key,
             }
         }
@@ -401,6 +440,18 @@ fn apply_env_overrides(config: &mut AppConfig) {
     if let Ok(key) = std::env::var("NOTYPE_DOUBAO_API_KEY") {
         if !key.is_empty() {
             config.model.doubao_api_key = key;
+        }
+    }
+
+    if let Ok(key) = std::env::var("NOTYPE_MIMO_API_KEY") {
+        if !key.is_empty() {
+            config.model.mimo_api_key = key;
+        }
+    }
+
+    if let Ok(url) = std::env::var("NOTYPE_MIMO_BASE_URL") {
+        if !url.is_empty() {
+            config.model.mimo_base_url = url;
         }
     }
 
@@ -471,6 +522,8 @@ mod tests {
         assert_eq!(config.general.hotkey, "Ctrl+.");
         assert!(config.model.gemini_api_key.is_empty());
         assert!(config.model.qwen_api_key.is_empty());
+        assert!(config.model.mimo_api_key.is_empty());
+        assert_eq!(config.model.mimo_base_url, "https://api.xiaomimimo.com/v1");
         assert!(config.model.doubao_api_key.is_empty());
         assert_eq!(config.model.doubao_base_url, "http://127.0.0.1:8000");
         assert!(config.model.enable_doubao_postprocess);
@@ -494,6 +547,32 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: AppConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.general.hotkey, config.general.hotkey);
+    }
+
+    #[test]
+    fn test_provider_parse_lowercase_and_legacy_case() {
+        let lower: AppConfig = toml::from_str(
+            r#"
+            [model]
+            provider = "mimo"
+            model_name = "mimo-v2.5-asr"
+            mimo_api_key = "test-key"
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(lower.model.provider, Provider::Mimo));
+        assert_eq!(lower.model.active_api_key(), "test-key");
+        assert!(lower.model.has_required_credentials());
+
+        let legacy: AppConfig = toml::from_str(
+            r#"
+            [model]
+            provider = "Qwen"
+            qwen_api_key = "test-key"
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(legacy.model.provider, Provider::Qwen));
     }
 
     #[test]

@@ -21,6 +21,9 @@ struct AppState {
     runtime: tokio::runtime::Handle,
     bubble_generation: Arc<AtomicU64>,
     hotkey_down: Arc<AtomicBool>,
+    /// True when the active capture session was started from the main window
+    /// (dictation mode: result goes to clipboard + window, not typed).
+    ui_capture: Arc<AtomicBool>,
     latest_interim_text: Arc<std::sync::Mutex<String>>,
     doubao_gateway_process: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
 }
@@ -175,6 +178,8 @@ fn set_interim_with_cache(
     }
     if should_emit {
         bubble::set_interim(app, text);
+        // Main window mirrors the live transcript when dictating from the UI.
+        let _ = app.emit("notype://interim", text.to_string());
     }
 }
 
@@ -185,17 +190,20 @@ fn get_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+#[derive(Clone, serde::Serialize)]
+struct AudioDeviceDto {
+    name: String,
+    is_default: bool,
+}
+
 #[tauri::command]
-fn list_audio_devices() -> Vec<String> {
+fn list_audio_devices() -> Vec<AudioDeviceDto> {
     notype_audio::list_input_devices()
         .unwrap_or_default()
         .into_iter()
-        .map(|d| {
-            if d.is_default {
-                format!("{} (default)", d.name)
-            } else {
-                d.name
-            }
+        .map(|d| AudioDeviceDto {
+            name: d.name,
+            is_default: d.is_default,
         })
         .collect()
 }
@@ -203,6 +211,205 @@ fn list_audio_devices() -> Vec<String> {
 #[tauri::command]
 fn is_recording(state: tauri::State<'_, AppState>) -> bool {
     state.recorder.is_recording()
+}
+
+// -- Capture control (shared by hotkey handler and UI button) --
+
+/// Start a capture session. `from_ui = true` means dictation mode started
+/// from the main window: the window stays visible, no bubble is shown, and
+/// the final text is copied instead of typed.
+fn start_capture(app: &tauri::AppHandle, from_ui: bool) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if state.recorder.is_recording() {
+        return Err("已在录音中".into());
+    }
+
+    state.bubble_generation.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut guard) = state.latest_interim_text.lock() {
+        guard.clear();
+    }
+    state.ui_capture.store(from_ui, Ordering::SeqCst);
+
+    if !from_ui {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.hide();
+        }
+    }
+
+    state.recorder.start().map_err(|e| e.to_string())?;
+
+    if !from_ui {
+        bubble::hide_bubble(app);
+        bubble::show_bubble(app);
+        bubble::set_recording(app);
+    }
+    emit_status(app, "Recording", None);
+
+    let rec_clone = Arc::clone(&state.recorder);
+    let recognizer = Arc::clone(&state.recognizer);
+    let cfg = Arc::clone(&state.config);
+    let handle = app.clone();
+    let gen = Arc::clone(&state.bubble_generation);
+    let latest_interim_text = Arc::clone(&state.latest_interim_text);
+    let gen_val = gen.load(Ordering::SeqCst);
+    state.runtime.spawn(async move {
+        interim_loop(
+            handle,
+            rec_clone,
+            recognizer,
+            cfg,
+            latest_interim_text,
+            gen,
+            gen_val,
+        )
+        .await;
+    });
+
+    Ok(())
+}
+
+/// Stop the current capture and hand the audio to the recognition pipeline.
+fn stop_capture(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if !state.recorder.is_recording() {
+        return Err("当前没有录音".into());
+    }
+
+    let audio = state.recorder.stop().map_err(|e| e.to_string())?;
+    tracing::info!(
+        duration = audio.duration_secs,
+        bytes = audio.wav_bytes.len(),
+        "Audio captured"
+    );
+
+    let from_ui = state.ui_capture.load(Ordering::SeqCst);
+    if !from_ui {
+        bubble::set_recognizing(app);
+    }
+    emit_status(app, "Recognizing", None);
+
+    let recognizer = Arc::clone(&state.recognizer);
+    let cfg = Arc::clone(&state.config);
+    let inputter = Arc::clone(&state.inputter);
+    let gen = Arc::clone(&state.bubble_generation);
+    let latest_interim_text = Arc::clone(&state.latest_interim_text);
+    let gateway_process = Arc::clone(&state.doubao_gateway_process);
+    let handle = app.clone();
+    state.runtime.spawn(async move {
+        process_audio(
+            &handle,
+            &recognizer,
+            &cfg,
+            &inputter,
+            gateway_process,
+            latest_interim_text.as_ref(),
+            &gen,
+            audio,
+            from_ui,
+        )
+        .await;
+    });
+
+    Ok(())
+}
+
+/// Abort the current capture, discarding the audio.
+fn cancel_capture(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    // Bump generation first so interim loops and pending finalize tasks bail out.
+    state.bubble_generation.fetch_add(1, Ordering::SeqCst);
+    if state.recorder.is_recording() {
+        let _ = state.recorder.stop();
+    }
+    if let Ok(mut guard) = state.latest_interim_text.lock() {
+        guard.clear();
+    }
+    state.hotkey_down.store(false, Ordering::SeqCst);
+    bubble::hide_bubble(app);
+    emit_status(app, "Ready", None);
+    tracing::info!("Capture cancelled by user");
+}
+
+/// Toggle dictation from the main window. Returns `true` if now recording.
+#[tauri::command]
+fn toggle_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    if state.recorder.is_recording() {
+        stop_capture(&app)?;
+        Ok(false)
+    } else {
+        start_capture(&app, true)?;
+        Ok(true)
+    }
+}
+
+#[tauri::command]
+fn cancel_recording(app: tauri::AppHandle) {
+    cancel_capture(&app);
+}
+
+// -- History --
+
+#[tauri::command]
+fn get_history() -> Vec<notype_config::history::HistoryEntry> {
+    notype_config::history::load()
+}
+
+#[tauri::command]
+fn delete_history_entry(id: u64) -> Result<Vec<notype_config::history::HistoryEntry>, String> {
+    notype_config::history::delete(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clear_history() -> Result<(), String> {
+    notype_config::history::clear().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn copy_text_to_clipboard(state: tauri::State<'_, AppState>, text: String) -> Result<(), String> {
+    state.inputter.copy_text(&text).map_err(|e| e.to_string())
+}
+
+// -- Autostart --
+
+#[cfg(desktop)]
+#[tauri::command]
+fn get_autostart(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    if enabled {
+        autolaunch.enable().map_err(|e| e.to_string())
+    } else {
+        autolaunch.disable().map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+fn get_autostart(_app: tauri::AppHandle) -> Result<bool, String> {
+    Ok(false)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+fn set_autostart(_app: tauri::AppHandle, _enabled: bool) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+fn open_config_dir(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = notype_config::config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -253,6 +460,7 @@ async fn save_config(
 
     config.model.provider = match dto.provider.to_lowercase().as_str() {
         "qwen" => notype_config::Provider::Qwen,
+        "mimo" | "xiaomi" => notype_config::Provider::Mimo,
         "doubao" => notype_config::Provider::Doubao,
         _ => notype_config::Provider::Gemini,
     };
@@ -261,6 +469,12 @@ async fn save_config(
     }
     if !dto.qwen_api_key.is_empty() {
         config.model.qwen_api_key = dto.qwen_api_key;
+    }
+    if !dto.mimo_api_key.is_empty() {
+        config.model.mimo_api_key = dto.mimo_api_key;
+    }
+    if !dto.mimo_base_url.trim().is_empty() {
+        config.model.mimo_base_url = dto.mimo_base_url;
     }
     if !dto.doubao_api_key.is_empty() {
         config.model.doubao_api_key = dto.doubao_api_key;
@@ -286,8 +500,20 @@ async fn save_config(
     }
     config.model.model_name = dto.model_name;
     config.general.hotkey = dto.hotkey.clone();
+    config.general.audio_device = dto.audio_device.trim().to_string();
+    config.general.input_mode = match dto.input_mode.to_lowercase().as_str() {
+        "clipboard" => notype_config::InputMode::Clipboard,
+        _ => notype_config::InputMode::Keyboard,
+    };
+    config.general.auto_copy = dto.auto_copy;
 
     notype_config::save(&config).map_err(|e| e.to_string())?;
+
+    // Apply microphone selection (effective on next recording).
+    let device = config.general.audio_device.clone();
+    state
+        .recorder
+        .set_device(if device.is_empty() { None } else { Some(device) });
 
     // Rebuild recognizer
     let new_recognizer = build_recognizer(&config);
@@ -343,6 +569,8 @@ struct ConfigDto {
     provider: String,
     gemini_api_key: String,
     qwen_api_key: String,
+    mimo_api_key: String,
+    mimo_base_url: String,
     doubao_api_key: String,
     doubao_base_url: String,
     doubao_official_app_key: String,
@@ -353,8 +581,15 @@ struct ConfigDto {
     doubao_ime_credential_path: String,
     model_name: String,
     hotkey: String,
+    #[serde(default)]
+    audio_device: String,
+    #[serde(default)]
+    input_mode: String,
+    #[serde(default)]
+    auto_copy: bool,
     has_gemini_key: bool,
     has_qwen_key: bool,
+    has_mimo_key: bool,
     has_doubao_key: bool,
     has_doubao_official_app_key: bool,
     has_doubao_official_access_key: bool,
@@ -365,12 +600,15 @@ impl ConfigDto {
         let provider = match config.model.provider {
             notype_config::Provider::Gemini => "gemini",
             notype_config::Provider::Qwen => "qwen",
+            notype_config::Provider::Mimo => "mimo",
             notype_config::Provider::Doubao => "doubao",
         };
         Self {
             provider: provider.into(),
             gemini_api_key: String::new(),
             qwen_api_key: String::new(),
+            mimo_api_key: String::new(),
+            mimo_base_url: config.model.mimo_base_url.clone(),
             doubao_api_key: String::new(),
             doubao_base_url: config.model.doubao_base_url.clone(),
             doubao_official_app_key: String::new(),
@@ -386,8 +624,16 @@ impl ConfigDto {
             doubao_ime_credential_path: config.model.doubao_ime_credential_path.clone(),
             model_name: config.model.model_name.clone(),
             hotkey: config.general.hotkey.clone(),
+            audio_device: config.general.audio_device.clone(),
+            input_mode: match config.general.input_mode {
+                notype_config::InputMode::Keyboard => "keyboard",
+                notype_config::InputMode::Clipboard => "clipboard",
+            }
+            .to_string(),
+            auto_copy: config.general.auto_copy,
             has_gemini_key: !config.model.gemini_api_key.is_empty(),
             has_qwen_key: !config.model.qwen_api_key.is_empty(),
+            has_mimo_key: !config.model.mimo_api_key.is_empty(),
             has_doubao_key: !config.model.doubao_api_key.is_empty(),
             has_doubao_official_app_key: !config.model.doubao_official_app_key.is_empty(),
             has_doubao_official_access_key: !config.model.doubao_official_access_key.is_empty(),
@@ -1069,28 +1315,47 @@ pub fn run() {
 
     let config = notype_config::load();
     let recognizer = build_recognizer(&config);
+    let audio_device = {
+        let name = config.general.audio_device.trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    };
 
     tracing::info!(
         provider = ?config.model.provider,
         model = %config.model.model_name,
         has_gemini_key = !config.model.gemini_api_key.is_empty(),
         has_qwen_key = !config.model.qwen_api_key.is_empty(),
+        has_mimo_key = !config.model.mimo_api_key.is_empty(),
         has_doubao_key = !config.model.doubao_api_key.is_empty(),
         has_doubao_official_app_key = !config.model.doubao_official_app_key.is_empty(),
         has_doubao_official_access_key = !config.model.doubao_official_access_key.is_empty(),
         "Config loaded"
     );
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+    let mut builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ));
+    }
+
+    builder
         .manage(AppState {
-            recorder: Arc::new(Recorder::new(None)),
+            recorder: Arc::new(Recorder::new(audio_device)),
             inputter: Arc::new(TextInputter::new()),
             recognizer: Arc::new(tokio::sync::RwLock::new(recognizer)),
             config: Arc::new(tokio::sync::RwLock::new(config)),
             runtime: runtime.handle().clone(),
             bubble_generation: Arc::new(AtomicU64::new(0)),
             hotkey_down: Arc::new(AtomicBool::new(false)),
+            ui_capture: Arc::new(AtomicBool::new(false)),
             latest_interim_text: Arc::new(std::sync::Mutex::new(String::new())),
             doubao_gateway_process: Arc::new(tokio::sync::Mutex::new(None)),
         })
@@ -1139,8 +1404,17 @@ pub fn run() {
             save_prompts,
             get_builtin_prompts,
             is_recording,
+            toggle_recording,
+            cancel_recording,
             get_config,
             save_config,
+            get_history,
+            delete_history_entry,
+            clear_history,
+            copy_text_to_clipboard,
+            get_autostart,
+            set_autostart,
+            open_config_dir,
             setup_doubao_realtime_runtime,
         ])
         .run(tauri::generate_context!())
@@ -1169,7 +1443,6 @@ fn setup_global_shortcut(app: &tauri::App) -> std::result::Result<(), Box<dyn st
         tauri_plugin_global_shortcut::Builder::new()
             .with_handler(move |app, _sc, event| {
                 let state = app.state::<AppState>();
-                let recorder = &state.recorder;
                 let hotkey_down = &state.hotkey_down;
 
                 match event.state() {
@@ -1181,47 +1454,17 @@ fn setup_global_shortcut(app: &tauri::App) -> std::result::Result<(), Box<dyn st
                             return;
                         }
 
-                        if !recorder.is_recording() {
-                            state.bubble_generation.fetch_add(1, Ordering::SeqCst);
-                            if let Ok(mut guard) = state.latest_interim_text.lock() {
-                                guard.clear();
-                            }
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.hide();
-                            }
-                            if let Err(e) = recorder.start() {
-                                hotkey_down.store(false, Ordering::SeqCst);
-                                tracing::error!("Failed to start recording: {e}");
-                                emit_status(app, "Error", Some(&e.to_string()));
-                            } else {
-                                bubble::hide_bubble(app);
-                                bubble::show_bubble(app);
-                                bubble::set_recording(app);
-                                emit_status(app, "Recording", None);
-
-                                // Start interim transcription loop
-                                let rec_clone = Arc::clone(&state.recorder);
-                                let recognizer = Arc::clone(&state.recognizer);
-                                let cfg = Arc::clone(&state.config);
-                                let handle = app.clone();
-                                let gen = Arc::clone(&state.bubble_generation);
-                                let latest_interim_text = Arc::clone(&state.latest_interim_text);
-                                let gen_val = gen.load(Ordering::SeqCst);
-                                state.runtime.spawn(async move {
-                                    interim_loop(
-                                        handle,
-                                        rec_clone,
-                                        recognizer,
-                                        cfg,
-                                        latest_interim_text,
-                                        gen,
-                                        gen_val,
-                                    )
-                                    .await;
-                                });
-                            }
-                        } else {
+                        if state.recorder.is_recording() {
+                            // A UI-initiated dictation is running; the hotkey must not
+                            // steal or restart that session.
                             hotkey_down.store(false, Ordering::SeqCst);
+                            return;
+                        }
+
+                        if let Err(e) = start_capture(app, false) {
+                            hotkey_down.store(false, Ordering::SeqCst);
+                            tracing::error!("Failed to start recording: {e}");
+                            emit_status(app, "Error", Some(&e));
                         }
                     }
                     ShortcutState::Released => {
@@ -1229,42 +1472,10 @@ fn setup_global_shortcut(app: &tauri::App) -> std::result::Result<(), Box<dyn st
                             return;
                         }
 
-                        if recorder.is_recording() {
-                            match recorder.stop() {
-                                Ok(audio) => {
-                                    tracing::info!(
-                                        duration = audio.duration_secs,
-                                        bytes = audio.wav_bytes.len(),
-                                        "Audio captured"
-                                    );
-                                    bubble::set_recognizing(app);
-                                    emit_status(app, "Recognizing", None);
-                                    let recognizer = Arc::clone(&state.recognizer);
-                                    let cfg = Arc::clone(&state.config);
-                                    let inputter = Arc::clone(&state.inputter);
-                                    let gen = Arc::clone(&state.bubble_generation);
-                                    let latest_interim_text = Arc::clone(&state.latest_interim_text);
-                                    let gateway_process = Arc::clone(&state.doubao_gateway_process);
-                                    let rt = state.runtime.clone();
-                                    let handle = app.clone();
-                                    rt.spawn(async move {
-                                        process_audio(
-                                            &handle,
-                                            &recognizer,
-                                            &cfg,
-                                            &inputter,
-                                            gateway_process,
-                                            latest_interim_text.as_ref(),
-                                            &gen,
-                                            audio,
-                                        )
-                                        .await;
-                                    });
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to stop recording: {e}");
-                                    emit_status(app, "Error", Some(&e.to_string()));
-                                }
+                        if state.recorder.is_recording() {
+                            if let Err(e) = stop_capture(app) {
+                                tracing::error!("Failed to stop recording: {e}");
+                                emit_status(app, "Error", Some(&e));
                             }
                         }
                     }
@@ -2959,25 +3170,70 @@ async fn postprocess_asr_text_streaming_live(
 
 // -- Audio Processing Pipeline --
 
+/// Everything the finalize step needs to know about the session/config,
+/// snapshotted once so late config edits can't change in-flight behavior.
+struct FinalizeCtx {
+    from_ui: bool,
+    input_mode: notype_config::InputMode,
+    auto_copy: bool,
+    provider_label: String,
+    model_name: String,
+    duration_secs: f32,
+}
+
 async fn emit_final_text(
     app: &tauri::AppHandle,
     inputter: &TextInputter,
     generation: &AtomicU64,
     gen_at_start: u64,
     text: &str,
+    ctx: &FinalizeCtx,
 ) {
     bubble::set_result(app, text);
     emit_status(app, "Done", Some(text));
-    if let Err(e) = inputter.type_text(text) {
-        tracing::error!("Failed to type text: {e}");
-        emit_status(app, "Error", Some(&e.to_string()));
+
+    // Persist to history and notify the main window.
+    match notype_config::history::append(
+        text,
+        &ctx.provider_label,
+        &ctx.model_name,
+        ctx.duration_secs,
+    ) {
+        Ok(entry) => {
+            let _ = app.emit("notype://result", entry);
+        }
+        Err(e) => tracing::warn!("Failed to persist history entry: {e}"),
     }
+
+    if ctx.from_ui {
+        // Dictation mode: the main window has focus, so typing would land in
+        // NoType itself. Copy instead; the window shows the text.
+        if let Err(e) = inputter.copy_text(text) {
+            tracing::warn!("Failed to copy dictation result: {e}");
+        }
+    } else {
+        let inject = match ctx.input_mode {
+            notype_config::InputMode::Keyboard => inputter.type_text(text),
+            notype_config::InputMode::Clipboard => inputter.paste_text(text),
+        };
+        if let Err(e) = inject {
+            tracing::error!("Failed to inject text: {e}");
+            emit_status(app, "Error", Some(&e.to_string()));
+        }
+        if ctx.auto_copy && ctx.input_mode == notype_config::InputMode::Keyboard {
+            if let Err(e) = inputter.copy_text(text) {
+                tracing::warn!("Failed to auto-copy result: {e}");
+            }
+        }
+    }
+
     bubble::enable_result_interaction(app);
     let display_secs = (5 + text.len() as u64 / 50).min(15);
     auto_hide_bubble(app, generation, gen_at_start, display_secs).await;
     emit_status(app, "Ready", None);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_audio(
     app: &tauri::AppHandle,
     recognizer: &tokio::sync::RwLock<Option<Box<dyn VoiceRecognizer>>>,
@@ -2987,6 +3243,7 @@ async fn process_audio(
     latest_interim_text: &std::sync::Mutex<String>,
     generation: &AtomicU64,
     audio: notype_audio::AudioData,
+    from_ui: bool,
 ) {
     let gen_at_start = generation.load(Ordering::SeqCst);
     let (
@@ -2997,8 +3254,15 @@ async fn process_audio(
         gateway_api_key,
         should_manage_gateway,
         using_doubao_ws_realtime,
+        finalize_ctx,
     ) = {
         let cfg = config.read().await;
+        let provider_label = match cfg.model.provider {
+            notype_config::Provider::Gemini => "gemini",
+            notype_config::Provider::Qwen => "qwen",
+            notype_config::Provider::Mimo => "mimo",
+            notype_config::Provider::Doubao => "doubao",
+        };
         (
             cfg.prompts.compose(),
             cfg.model.provider.clone(),
@@ -3007,6 +3271,14 @@ async fn process_audio(
             cfg.model.doubao_api_key.clone(),
             should_manage_local_doubao_gateway(&cfg),
             should_use_doubao_ws_realtime(&cfg),
+            FinalizeCtx {
+                from_ui,
+                input_mode: cfg.general.input_mode.clone(),
+                auto_copy: cfg.general.auto_copy,
+                provider_label: provider_label.to_string(),
+                model_name: cfg.model.model_name.clone(),
+                duration_secs: audio.duration_secs,
+            },
         )
     };
     let is_doubao_provider = matches!(active_provider, notype_config::Provider::Doubao);
@@ -3047,7 +3319,15 @@ async fn process_audio(
             chars = latest_preview.chars().count(),
             "Finalize Doubao transcription from live preview"
         );
-        emit_final_text(app, inputter, generation, gen_at_start, &latest_preview).await;
+        emit_final_text(
+            app,
+            inputter,
+            generation,
+            gen_at_start,
+            &latest_preview,
+            &finalize_ctx,
+        )
+        .await;
         return;
     }
 
@@ -3129,7 +3409,15 @@ async fn process_audio(
                 return;
             }
 
-            emit_final_text(app, inputter, generation, gen_at_start, &final_text).await;
+            emit_final_text(
+                app,
+                inputter,
+                generation,
+                gen_at_start,
+                &final_text,
+                &finalize_ctx,
+            )
+            .await;
         }
         Err(e) => {
             let error_msg = e.to_string();
@@ -3157,8 +3445,15 @@ async fn process_audio(
                         "Final Doubao recognition failed, fallback to latest interim text"
                     );
                     if !fallback_text.trim().is_empty() {
-                        emit_final_text(app, inputter, generation, gen_at_start, &fallback_text)
-                            .await;
+                        emit_final_text(
+                            app,
+                            inputter,
+                            generation,
+                            gen_at_start,
+                            &fallback_text,
+                            &finalize_ctx,
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -3200,6 +3495,7 @@ fn build_recognizer(config: &notype_config::AppConfig) -> Option<Box<dyn VoiceRe
     let provider = match config.model.provider {
         notype_config::Provider::Gemini => notype_llm::Provider::Gemini,
         notype_config::Provider::Qwen => notype_llm::Provider::Qwen,
+        notype_config::Provider::Mimo => notype_llm::Provider::Mimo,
         notype_config::Provider::Doubao => notype_llm::Provider::Doubao,
     };
 
@@ -3208,6 +3504,7 @@ fn build_recognizer(config: &notype_config::AppConfig) -> Option<Box<dyn VoiceRe
         config.model.active_api_key().to_string(),
         notype_llm::RecognizerOptions {
             model: Some(config.model.model_name.clone()),
+            mimo_base_url: Some(config.model.mimo_base_url.clone()),
             doubao_base_url: Some(config.model.doubao_base_url.clone()),
             doubao_official_app_key: if config.model.doubao_official_app_key.is_empty() {
                 None
