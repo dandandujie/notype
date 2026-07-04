@@ -54,6 +54,48 @@ impl TextInputter {
         Ok(())
     }
 
+    /// Press Enter in the focused app (auto-send after dictation).
+    pub fn press_enter(&self) -> Result<()> {
+        let mut guard = self.enigo.lock().unwrap();
+        let enigo = guard.as_mut().ok_or(InputError::PermissionDenied)?;
+        enigo
+            .key(Key::Return, Direction::Click)
+            .map_err(|e| InputError::SimulationFailed(e.to_string()))
+    }
+
+    /// Read the current clipboard text (empty string if none).
+    pub fn read_text(&self) -> Result<String> {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| InputError::ClipboardFailed(e.to_string()))?;
+        Ok(clipboard.get_text().unwrap_or_default())
+    }
+
+    /// Fire the platform copy chord (Cmd/Ctrl+C) at the focused app —
+    /// used to pull the user's current selection into the clipboard.
+    pub fn send_copy_shortcut(&self) -> Result<()> {
+        let mut guard = self.enigo.lock().unwrap();
+        let enigo = guard.as_mut().ok_or(InputError::PermissionDenied)?;
+
+        let modifier = if cfg!(target_os = "macos") {
+            Key::Meta
+        } else {
+            Key::Control
+        };
+
+        enigo
+            .key(modifier, Direction::Press)
+            .map_err(|e| InputError::SimulationFailed(e.to_string()))?;
+        let click = enigo
+            .key(Key::Unicode('c'), Direction::Click)
+            .map_err(|e| InputError::SimulationFailed(e.to_string()));
+        let release = enigo
+            .key(modifier, Direction::Release)
+            .map_err(|e| InputError::SimulationFailed(e.to_string()));
+        click?;
+        release?;
+        Ok(())
+    }
+
     /// Put text on the system clipboard without touching the focused app.
     pub fn copy_text(&self, text: &str) -> Result<()> {
         let mut clipboard =

@@ -8,6 +8,7 @@ declare global {
     showInterim: (text: string) => void;
     showResult: (text: string) => void;
     showError: (text: string) => void;
+    setLevel: (level: number) => void;
   }
 }
 
@@ -563,6 +564,42 @@ async function copyAsText() {
 $("copy-btn").addEventListener("click", copyAsImage);
 $("copy-text-btn").addEventListener("click", copyAsText);
 
+// -- Live level-driven waveform --
+
+const LEVEL_WEIGHTS = [0.45, 0.62, 0.85, 1, 0.9, 1, 0.85, 0.62, 0.45];
+let smoothedLevel = 0;
+
+function pillWaveBars(): { wave: HTMLElement; bars: HTMLElement[] } {
+  const wave = document.querySelector<HTMLElement>("#pill .waveform")!;
+  return { wave, bars: Array.from(wave.querySelectorAll("i")) };
+}
+
+function resetPillWave() {
+  smoothedLevel = 0;
+  const { wave, bars } = pillWaveBars();
+  wave.classList.remove("live");
+  bars.forEach((b) => {
+    b.style.height = "";
+  });
+}
+
+window.setLevel = function (level: number) {
+  const pill = $("pill");
+  if (!pill.classList.contains("recording") || level <= 0) {
+    if (smoothedLevel > 0) resetPillWave();
+    return;
+  }
+  const amp = Math.min(1, level * 7);
+  smoothedLevel = smoothedLevel * 0.55 + amp * 0.45;
+  const { wave, bars } = pillWaveBars();
+  wave.classList.add("live");
+  bars.forEach((bar, i) => {
+    const jitter = 0.82 + Math.random() * 0.36;
+    const h = 4 + LEVEL_WEIGHTS[i] * smoothedLevel * 19 * jitter;
+    bar.style.height = `${Math.max(3, Math.min(22, h))}px`;
+  });
+};
+
 // -- Public API --
 
 window.showRecording = function () {
@@ -580,6 +617,7 @@ window.showRecording = function () {
   getCanvas().className = "hidden";
   $("card-actions").classList.remove("visible");
   $("pill").className = "pill recording";
+  resetPillWave();
   $("card").className = "card";
   $("card-content").scrollTop = 0;
 
@@ -590,6 +628,7 @@ window.showRecognizing = function () {
   isInterim = false;
   stopCursorBlink();
   $("pill").className = "pill recognizing";
+  resetPillWave();
 };
 
 window.showInterim = function (text: string) {
@@ -617,6 +656,7 @@ window.showResult = function (text: string) {
   $("dots").className = "typing-dots hidden";
   getCanvas().className = "";
   $("pill").className = "pill ready";
+  resetPillWave();
   $("card").className = "card text-mode";
 
   isInterim = false;
@@ -639,6 +679,7 @@ window.showError = function (text: string) {
   $("dots").className = "typing-dots hidden";
   getCanvas().className = "";
   $("pill").className = "pill hidden";
+  resetPillWave();
   $("card").className = "card text-mode";
 
   isInterim = false;

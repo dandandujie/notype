@@ -92,6 +92,11 @@ pub fn set_recognizing(app: &tauri::AppHandle) {
     set_cursor_passthrough(app, true);
 }
 
+/// Push the live microphone level (0.0..~1.0) so the waveform tracks the voice.
+pub fn set_level(app: &tauri::AppHandle, level: f32) {
+    eval_bubble(app, &format!("window.setLevel && setLevel({level})"));
+}
+
 /// Show interim (partial) transcription while still recording.
 pub fn set_interim(app: &tauri::AppHandle, text: &str) {
     let escaped = text

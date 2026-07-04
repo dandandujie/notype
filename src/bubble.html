@@ -143,6 +143,12 @@
       .pill.recording .waveform i:nth-child(8) { animation-delay: 0.49s; }
       .pill.recording .waveform i:nth-child(9) { animation-delay: 0.56s; }
 
+      /* 真实音量驱动时关闭预设动画 */
+      .pill.recording .waveform.live i {
+        animation: none;
+        transition: height 90ms ease-out;
+      }
+
       @keyframes wave {
         0%   { height: 4px; }
         100% { height: 22px; }

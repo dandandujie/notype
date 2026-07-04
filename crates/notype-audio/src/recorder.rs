@@ -4,7 +4,7 @@
 //! is not `Send + Sync`. Communication happens via channels.
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     mpsc, Arc,
 };
 
@@ -32,6 +32,8 @@ enum Command {
 pub struct Recorder {
     cmd_tx: mpsc::Sender<Command>,
     recording: Arc<AtomicBool>,
+    /// Latest RMS input level (0.0..~1.0), f32 stored as bits.
+    level: Arc<AtomicU32>,
 }
 
 // Recorder owns only Send types (mpsc::Sender + Arc<AtomicBool>)
@@ -44,19 +46,33 @@ impl Recorder {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
         let recording = Arc::new(AtomicBool::new(false));
         let recording_clone = Arc::clone(&recording);
+        let level = Arc::new(AtomicU32::new(0));
+        let level_clone = Arc::clone(&level);
 
         std::thread::Builder::new()
             .name("notype-audio".into())
             .spawn(move || {
-                audio_thread(cmd_rx, recording_clone, device_name);
+                audio_thread(cmd_rx, recording_clone, level_clone, device_name);
             })
             .expect("failed to spawn audio thread");
 
-        Self { cmd_tx, recording }
+        Self {
+            cmd_tx,
+            recording,
+            level,
+        }
     }
 
     pub fn is_recording(&self) -> bool {
         self.recording.load(Ordering::Relaxed)
+    }
+
+    /// Latest microphone RMS level (0.0..~1.0). 0.0 when not recording.
+    pub fn input_level(&self) -> f32 {
+        if !self.is_recording() {
+            return 0.0;
+        }
+        f32::from_bits(self.level.load(Ordering::Relaxed))
     }
 
     /// Switch the target input device. Takes effect on the next `start()`;
@@ -138,6 +154,7 @@ impl Recorder {
 fn audio_thread(
     cmd_rx: mpsc::Receiver<Command>,
     recording: Arc<AtomicBool>,
+    level: Arc<AtomicU32>,
     device_name: Option<String>,
 ) {
     let mut device_name = device_name;
@@ -187,6 +204,7 @@ fn audio_thread(
 
                 let buf = Arc::clone(&buffer);
                 let rec = Arc::clone(&recording);
+                let lvl = Arc::clone(&level);
                 let stream_config: cpal::StreamConfig = config.into();
 
                 match device.build_input_stream(
@@ -194,6 +212,12 @@ fn audio_thread(
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         if rec.load(Ordering::Relaxed) {
                             buf.lock().unwrap().extend_from_slice(data);
+                            // RMS level for live waveform feedback.
+                            if !data.is_empty() {
+                                let sum_sq: f32 = data.iter().map(|s| s * s).sum();
+                                let rms = (sum_sq / data.len() as f32).sqrt();
+                                lvl.store(rms.to_bits(), Ordering::Relaxed);
+                            }
                         }
                     },
                     |err| tracing::error!("Audio stream error: {err}"),
@@ -316,6 +340,7 @@ fn audio_thread(
                 // Brief yield to let any in-flight callbacks finish writing
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 recording.store(false, Ordering::Relaxed);
+                level.store(0f32.to_bits(), Ordering::Relaxed);
 
                 let samples: Vec<f32> = std::mem::take(&mut *buffer.lock().unwrap());
                 let total = samples.len() as f32;

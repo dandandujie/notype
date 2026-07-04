@@ -40,20 +40,50 @@
           </button>
 
           <p class="shortcut-hint">
-            按住 <kbd class="mono" id="hotkey-hint">Ctrl + .</kbd> 全局输入 · 点按按钮窗口听写
+            按住 <kbd class="mono" id="hotkey-hint">Ctrl + .</kbd> 说话，快速短按可锁定 · 点按按钮窗口听写
           </p>
+          <p class="shortcut-hint" id="edit-hint">
+            选中文本按住 <kbd class="mono" id="edit-hotkey-hint">Ctrl + ,</kbd> 说出修改指令
+          </p>
+
+          <div class="seg seg-style" id="style-seg" title="输出风格">
+            <button type="button" class="seg-btn" data-style="polish">智能整理</button>
+            <button type="button" class="seg-btn" data-style="verbatim">逐字</button>
+            <button type="button" class="seg-btn" data-style="translate_en">译英</button>
+          </div>
+
           <button type="button" class="rec-cancel" id="rec-cancel" hidden>取消 <span class="mono">Esc</span></button>
+          <button type="button" class="setup-nudge" id="setup-nudge" hidden>尚未配置识别引擎 · 点此完成设置 →</button>
         </div>
 
         <div class="result-card" id="result-card" hidden>
           <div class="result-head">
             <span class="result-label" id="result-label">听写结果</span>
             <span class="result-time mono" id="result-time"></span>
+            <button type="button" class="icon-btn" id="edit-result" title="纠错（修改会自动学进词典）">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg>
+            </button>
             <button type="button" class="icon-btn" id="copy-result" title="复制文本">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
             </button>
           </div>
           <p class="result-text" id="result-text"></p>
+        </div>
+
+        <button type="button" class="perso" id="perso-bar" hidden title="个性化程度：词典、纠错学习和使用习惯的积累 — 点击管理词典">
+          <span class="perso-label">越用越懂你</span>
+          <span class="perso-track"><span class="perso-fill" id="perso-fill"></span></span>
+          <span class="perso-pct mono" id="perso-pct">0%</span>
+        </button>
+
+        <div class="stats-strip mono" id="stats-strip" hidden>
+          <span class="stat">累计 <b id="stat-chars">0</b> 字</span>
+          <span class="stat-sep"></span>
+          <span class="stat"><b id="stat-speed">–</b> 字/分</span>
+          <span class="stat-sep"></span>
+          <span class="stat">省 <b id="stat-saved">0</b></span>
+          <span class="stat-sep"></span>
+          <span class="stat">连续 <b id="stat-streak">0</b> 天</span>
         </div>
       </section>
 
@@ -61,7 +91,13 @@
       <section class="view" id="view-history">
         <div class="view-head">
           <h2 class="view-title">转写历史</h2>
-          <button type="button" class="btn-text" id="clear-history">清空</button>
+          <div class="head-actions">
+            <button type="button" class="btn-text" id="export-history">导出</button>
+            <button type="button" class="btn-text" id="clear-history">清空</button>
+          </div>
+        </div>
+        <div class="history-search">
+          <input type="text" id="history-search" placeholder="搜索历史…" autocomplete="off" spellcheck="false" />
         </div>
         <ul class="history-list" id="history-list"></ul>
         <div class="empty-state" id="history-empty" hidden>
@@ -76,6 +112,13 @@
           <button type="button" class="tab active" data-tab="agent">角色指令</button>
           <button type="button" class="tab" data-tab="rules">转录规则</button>
           <button type="button" class="tab" data-tab="vocabulary">专有词汇</button>
+          <button type="button" class="tab" data-tab="replace_rules">替换规则</button>
+        </div>
+        <div class="vocab-quick" id="vocab-quick" hidden>
+          <input type="text" id="vocab-wrong" placeholder="听错的词" autocomplete="off" spellcheck="false" />
+          <span class="vocab-arrow mono">→</span>
+          <input type="text" id="vocab-right" placeholder="正确写法" autocomplete="off" spellcheck="false" />
+          <button type="button" class="btn-outline btn-xs" id="vocab-add">添加</button>
         </div>
         <div class="editor-wrap">
           <textarea class="editor" id="prompt-editor" spellcheck="false" placeholder="在此编辑提示词…"></textarea>
@@ -100,16 +143,17 @@
             <h3 class="s-section-title">识别引擎</h3>
 
             <div class="s-field">
-              <span class="s-label">服务商</span>
-              <div class="seg" id="provider-seg">
+              <div class="seg seg-provider" id="provider-seg">
                 <button type="button" class="seg-btn" data-value="qwen">Qwen</button>
                 <button type="button" class="seg-btn" data-value="gemini">Gemini</button>
                 <button type="button" class="seg-btn" data-value="mimo">MiMo</button>
-                <button type="button" class="seg-btn" data-value="doubao">Doubao</button>
+                <button type="button" class="seg-btn" data-value="volcengine">火山流式</button>
+                <button type="button" class="seg-btn" data-value="whisper">Whisper</button>
+                <button type="button" class="seg-btn" data-value="apple">Apple</button>
               </div>
             </div>
 
-            <label class="s-field">
+            <label class="s-field" id="model-field">
               <span class="s-label">模型</span>
               <div class="s-select">
                 <select id="model-name">
@@ -118,19 +162,15 @@
                     <option value="gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite</option>
                   </optgroup>
                   <optgroup label="Qwen" id="qwen-models">
-                    <option value="qwen3.5-omni-flash">qwen3.5-omni-flash</option>
-                    <option value="qwen3.5-omni-plus">qwen3.5-omni-plus</option>
+                    <option value="qwen3.5-omni-flash">qwen3.5-omni-flash（多模态）</option>
+                    <option value="qwen3.5-omni-plus">qwen3.5-omni-plus（多模态）</option>
+                    <option value="qwen3-asr-flash">qwen3-asr-flash（专用 ASR + LLM 润色）</option>
                   </optgroup>
                   <optgroup label="Xiaomi MiMo" id="mimo-models">
                     <option value="mimo-v2.5-asr">mimo-v2.5-asr</option>
                     <option value="mimo-v2.5">mimo-v2.5</option>
                     <option value="mimo-v2-omni">mimo-v2-omni</option>
                     <option value="mimo-v2.5-pro">mimo-v2.5-pro</option>
-                  </optgroup>
-                  <optgroup label="Doubao ASR" id="doubao-models">
-                    <option value="doubao-asr">doubao-asr (ASR2API)</option>
-                    <option value="doubao-asr-official-flash">doubao-asr-official-flash</option>
-                    <option value="doubao-asr-official-standard">doubao-asr-official-standard</option>
                   </optgroup>
                 </select>
               </div>
@@ -147,16 +187,24 @@
               <span class="s-hint" id="gemini-key-hint"></span>
             </label>
 
-            <label class="s-field" id="qwen-key-field">
-              <span class="s-label">Qwen API Key</span>
-              <div class="s-key-row">
-                <input type="password" id="qwen-api-key" placeholder="粘贴 Qwen Key" autocomplete="off" spellcheck="false" />
-                <button type="button" class="s-eye toggle-key-btn" data-target="qwen-api-key" title="显示 / 隐藏">
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-                </button>
-              </div>
-              <span class="s-hint" id="qwen-key-hint"></span>
-            </label>
+            <div id="qwen-fields" hidden>
+              <label class="s-field">
+                <span class="s-label">Qwen API Key</span>
+                <div class="s-key-row">
+                  <input type="password" id="qwen-api-key" placeholder="粘贴 Qwen Key（本地部署可留空）" autocomplete="off" spellcheck="false" />
+                  <button type="button" class="s-eye toggle-key-btn" data-target="qwen-api-key" title="显示 / 隐藏">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                  </button>
+                </div>
+                <span class="s-hint" id="qwen-key-hint"></span>
+              </label>
+
+              <label class="s-field">
+                <span class="s-label">Qwen 接入点</span>
+                <input type="text" id="qwen-base-url" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" autocomplete="off" spellcheck="false" />
+                <span class="s-hint">本地部署（vLLM / SGLang）时改成本地地址，如 http://127.0.0.1:8000/v1</span>
+              </label>
+            </div>
 
             <div id="mimo-fields" hidden>
               <label class="s-field">
@@ -176,86 +224,125 @@
               </label>
             </div>
 
-            <div id="doubao-fields" hidden>
+            <div id="volc-fields" hidden>
               <label class="s-field">
-                <span class="s-label">ASR2API 网关地址</span>
-                <input type="text" id="doubao-base-url" placeholder="http://127.0.0.1:8000" autocomplete="off" spellcheck="false" />
-              </label>
-
-              <label class="s-field">
-                <span class="s-label">网关 Key（可选）</span>
+                <span class="s-label">App Key（APP ID）</span>
                 <div class="s-key-row">
-                  <input type="password" id="doubao-api-key" placeholder="粘贴网关 Key（可选）" autocomplete="off" spellcheck="false" />
-                  <button type="button" class="s-eye toggle-key-btn" data-target="doubao-api-key" title="显示 / 隐藏">
+                  <input type="password" id="volc-app-key" placeholder="火山控制台的 APP ID" autocomplete="off" spellcheck="false" />
+                  <button type="button" class="s-eye toggle-key-btn" data-target="volc-app-key" title="显示 / 隐藏">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                   </button>
                 </div>
-                <span class="s-hint" id="doubao-key-hint"></span>
+                <span class="s-hint" id="volc-app-key-hint"></span>
               </label>
 
-              <div id="doubao-official-key-fields" hidden>
+              <label class="s-field">
+                <span class="s-label">Access Key（Access Token）</span>
+                <div class="s-key-row">
+                  <input type="password" id="volc-access-key" placeholder="火山控制台的 Access Token" autocomplete="off" spellcheck="false" />
+                  <button type="button" class="s-eye toggle-key-btn" data-target="volc-access-key" title="显示 / 隐藏">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                  </button>
+                </div>
+                <span class="s-hint" id="volc-access-key-hint"></span>
+              </label>
+
+              <label class="s-field">
+                <span class="s-label">Resource ID</span>
+                <input type="text" id="volc-resource-id" placeholder="volc.bigasr.sauc.duration" autocomplete="off" spellcheck="false" />
+                <span class="s-hint">小时版 volc.bigasr.sauc.duration · 并发版 volc.bigasr.sauc.concurrent · 2.0 换成 seedasr</span>
+              </label>
+            </div>
+
+            <div id="whisper-fields" hidden>
+              <label class="s-field">
+                <span class="s-label">接入点（/v1 根地址）</span>
+                <input type="text" id="whisper-base-url" placeholder="https://api.openai.com/v1" autocomplete="off" spellcheck="false" />
+                <span class="s-hint">兼容 OpenAI / Groq / whisper.cpp server / faster-whisper 等一切 /audio/transcriptions 服务</span>
+              </label>
+
+              <div class="s-row">
                 <label class="s-field">
-                  <span class="s-label">官方 App Key</span>
+                  <span class="s-label">API Key（可选）</span>
                   <div class="s-key-row">
-                    <input type="password" id="doubao-official-app-key" placeholder="粘贴官方 App Key" autocomplete="off" spellcheck="false" />
-                    <button type="button" class="s-eye toggle-key-btn" data-target="doubao-official-app-key" title="显示 / 隐藏">
+                    <input type="password" id="whisper-api-key" placeholder="本地服务可留空" autocomplete="off" spellcheck="false" />
+                    <button type="button" class="s-eye toggle-key-btn" data-target="whisper-api-key" title="显示 / 隐藏">
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                     </button>
                   </div>
-                  <span class="s-hint" id="doubao-official-app-key-hint"></span>
+                  <span class="s-hint" id="whisper-key-hint"></span>
                 </label>
-
                 <label class="s-field">
-                  <span class="s-label">官方 Access Key</span>
+                  <span class="s-label">模型</span>
+                  <input type="text" id="whisper-model" placeholder="whisper-1" autocomplete="off" spellcheck="false" />
+                </label>
+              </div>
+            </div>
+
+            <div id="apple-fields" hidden>
+              <label class="s-field">
+                <span class="s-label">识别语言（BCP-47）</span>
+                <input type="text" id="apple-locale" placeholder="留空跟随系统，如 zh-CN / en-US" autocomplete="off" spellcheck="false" />
+                <span class="s-hint">macOS 本地识别，免费离线。首次使用会弹出「语音识别」授权，请允许</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="s-section">
+            <h3 class="s-section-title">AI 润色</h3>
+
+            <div class="s-row">
+              <div class="s-field s-field-switch">
+                <span class="s-label">LLM 润色</span>
+                <label class="switch">
+                  <input type="checkbox" id="postprocess-enabled" />
+                  <span class="switch-track"><span class="switch-thumb"></span></span>
+                </label>
+              </div>
+              <div class="s-field s-field-switch">
+                <span class="s-label">结构化输出</span>
+                <label class="switch">
+                  <input type="checkbox" id="structured-output" />
+                  <span class="switch-track"><span class="switch-thumb"></span></span>
+                </label>
+              </div>
+            </div>
+            <p class="s-hint">润色对专用 ASR 引擎（火山 / Whisper / Apple / Qwen-ASR）生效：自动分段、数字格式化、符号口令、词汇校正。结构化输出关闭后只按语义分段，不做列表排版</p>
+
+            <label class="s-field">
+              <span class="s-label">润色服务</span>
+              <div class="s-select">
+                <select id="postprocess-provider">
+                  <option value="auto">自动（自定义 → Qwen → Gemini → MiMo）</option>
+                  <option value="custom">自定义（任意 OpenAI 兼容厂商）</option>
+                  <option value="qwen">Qwen</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="mimo">MiMo</option>
+                </select>
+              </div>
+            </label>
+
+            <div id="custom-llm-fields" hidden>
+              <label class="s-field">
+                <span class="s-label">接入点（/v1 根地址）</span>
+                <input type="text" id="custom-llm-base-url" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" />
+              </label>
+              <div class="s-row">
+                <label class="s-field">
+                  <span class="s-label">API Key</span>
                   <div class="s-key-row">
-                    <input type="password" id="doubao-official-access-key" placeholder="粘贴官方 Access Key" autocomplete="off" spellcheck="false" />
-                    <button type="button" class="s-eye toggle-key-btn" data-target="doubao-official-access-key" title="显示 / 隐藏">
+                    <input type="password" id="custom-llm-api-key" placeholder="粘贴 Key" autocomplete="off" spellcheck="false" />
+                    <button type="button" class="s-eye toggle-key-btn" data-target="custom-llm-api-key" title="显示 / 隐藏">
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                     </button>
                   </div>
-                  <span class="s-hint" id="doubao-official-access-key-hint"></span>
+                  <span class="s-hint" id="custom-llm-key-hint"></span>
                 </label>
-              </div>
-
-              <div class="s-row">
-                <div class="s-field s-field-switch">
-                  <span class="s-label">LLM 实时后处理</span>
-                  <label class="switch">
-                    <input type="checkbox" id="doubao-postprocess-enabled" />
-                    <span class="switch-track"><span class="switch-thumb"></span></span>
-                  </label>
-                </div>
                 <label class="s-field">
-                  <span class="s-label">后处理偏好</span>
-                  <div class="s-select">
-                    <select id="doubao-postprocess-provider">
-                      <option value="auto">自动（Qwen → Gemini）</option>
-                      <option value="qwen">优先 Qwen</option>
-                      <option value="gemini">优先 Gemini</option>
-                    </select>
-                  </div>
+                  <span class="s-label">模型</span>
+                  <input type="text" id="custom-llm-model" placeholder="如 deepseek-chat" autocomplete="off" spellcheck="false" />
                 </label>
               </div>
-
-              <div class="s-row">
-                <div class="s-field s-field-switch">
-                  <span class="s-label">WS 实时预览</span>
-                  <label class="switch">
-                    <input type="checkbox" id="doubao-realtime-ws-enabled" />
-                    <span class="switch-track"><span class="switch-thumb"></span></span>
-                  </label>
-                </div>
-                <label class="s-field">
-                  <span class="s-label">IME 凭证路径</span>
-                  <input type="text" id="doubao-ime-credential-path" placeholder="~/.config/doubaoime-asr/credentials.json" autocomplete="off" spellcheck="false" />
-                </label>
-              </div>
-
-              <button type="button" class="btn-outline" id="doubao-setup-btn">
-                一键安装依赖、初始化凭证并启动网关
-              </button>
-              <p class="s-hint" id="doubao-setup-status"></p>
-              <p class="s-hint" id="doubao-postprocess-hint"></p>
             </div>
           </div>
 
@@ -264,16 +351,22 @@
 
             <div class="s-row">
               <label class="s-field">
-                <span class="s-label">快捷键</span>
+                <span class="s-label">听写快捷键</span>
                 <input type="text" id="hotkey" class="mono" placeholder="点击后按下组合键…" />
               </label>
               <label class="s-field">
-                <span class="s-label">麦克风</span>
-                <div class="s-select">
-                  <select id="audio-device"><option value="">加载中…</option></select>
-                </div>
+                <span class="s-label">语音编辑快捷键</span>
+                <input type="text" id="edit-hotkey" class="mono" placeholder="留空禁用" />
               </label>
             </div>
+            <p class="s-hint">语音编辑：在任意应用选中文本，按住编辑快捷键说指令（如「改得正式一点」「翻译成英文」），松开后选中文本被替换。按 ⌫ 可清空禁用</p>
+
+            <label class="s-field">
+              <span class="s-label">麦克风</span>
+              <div class="s-select">
+                <select id="audio-device"><option value="">加载中…</option></select>
+              </div>
+            </label>
 
             <div class="s-row">
               <label class="s-field">
@@ -293,6 +386,37 @@
                 </label>
               </div>
             </div>
+
+            <div class="s-row">
+              <div class="s-field s-field-switch">
+                <span class="s-label">流式逐字输出</span>
+                <label class="switch">
+                  <input type="checkbox" id="stream-typing" />
+                  <span class="switch-track"><span class="switch-thumb"></span></span>
+                </label>
+              </div>
+              <div class="s-field s-field-switch">
+                <span class="s-label">自动发送（回车）</span>
+                <label class="switch">
+                  <input type="checkbox" id="auto-enter" />
+                  <span class="switch-track"><span class="switch-thumb"></span></span>
+                </label>
+              </div>
+            </div>
+            <p class="s-hint">流式输出：AI 边生成边打字，失败自动回退整段粘贴。自动发送：输入完成后自动按回车——聊天场景说完即发，慎用于文档</p>
+
+            <div class="s-field s-field-switch">
+              <span class="s-label">应用场景感知</span>
+              <label class="switch">
+                <input type="checkbox" id="app-context" />
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+              </label>
+            </div>
+            <label class="s-field">
+              <span class="s-label">应用语气规则（覆盖内置，每行一条）</span>
+              <textarea id="app-rules" class="s-textarea" rows="3" placeholder="微信 = 语气亲切简短，结尾不加句号&#10;cursor = 保留所有英文术语和代码原文" spellcheck="false"></textarea>
+            </label>
+            <p class="s-hint">识别正在输入的应用并调整语气——邮件正式、聊天口语、编辑器保留术语。左边写应用名关键词，右边写你想要的语气指令</p>
           </div>
 
           <div class="s-section">
@@ -306,10 +430,24 @@
                   <span class="switch-track"><span class="switch-thumb"></span></span>
                 </label>
               </div>
-              <div class="s-field">
-                <span class="s-label">配置文件</span>
-                <button type="button" class="btn-outline btn-sm" id="open-config-dir">打开配置文件夹</button>
+              <div class="s-field s-field-switch">
+                <span class="s-label">提示音</span>
+                <label class="switch">
+                  <input type="checkbox" id="sound-feedback" />
+                  <span class="switch-track"><span class="switch-thumb"></span></span>
+                </label>
               </div>
+            </div>
+
+            <div class="s-field">
+              <span class="s-label">配置文件</span>
+              <button type="button" class="btn-outline btn-sm" id="open-config-dir">打开配置文件夹</button>
+            </div>
+
+            <div class="perm-row" id="perm-row" hidden>
+              <span class="s-label">辅助功能权限</span>
+              <span class="s-hint bad">未授权 — 无法向其他应用输入文字</span>
+              <button type="button" class="btn-outline btn-xs" id="open-accessibility">前往授权</button>
             </div>
           </div>
 
@@ -322,5 +460,76 @@
       </section>
 
     </main>
+
+    <!-- ============ 首次启动引导 ============ -->
+    <div class="onboard" id="onboard" hidden>
+      <div class="onboard-card">
+        <div class="ob-step" data-step="1">
+          <div class="ob-mark">
+            <span class="ob-led"></span>
+            <span class="mono ob-brand">NoType</span>
+          </div>
+          <h2 class="ob-title">说话，别打字</h2>
+          <p class="ob-sub">按住快捷键说话，AI 把口语整理成像认真打出来的文字，直接落进光标。去口水词、修改口、自动排版——比打字快 4 倍。</p>
+          <div class="ob-actions">
+            <button type="button" class="btn-primary ob-next">开始设置</button>
+          </div>
+        </div>
+
+        <div class="ob-step" data-step="2" hidden>
+          <h2 class="ob-title">选择识别引擎</h2>
+          <div class="ob-options">
+            <label class="ob-option">
+              <input type="radio" name="ob-engine" value="qwen" checked />
+              <span class="ob-option-body"><b>Qwen（推荐）</b><small>中文效果好 · 速度快 · 需要 API Key</small></span>
+            </label>
+            <label class="ob-option" id="ob-apple-option">
+              <input type="radio" name="ob-engine" value="apple" />
+              <span class="ob-option-body"><b>Apple 本地识别</b><small>零配置 · 离线免费 · 无需 Key（macOS）</small></span>
+            </label>
+          </div>
+          <input type="password" id="ob-key" class="ob-input" placeholder="粘贴 Qwen API Key（阿里云百炼控制台申请）" autocomplete="off" spellcheck="false" />
+          <p class="s-hint">更多引擎（Gemini / MiMo / 火山流式 / Whisper 兼容 / 本地部署）可稍后在设置中配置</p>
+          <p class="s-hint bad" id="ob-engine-err"></p>
+          <div class="ob-actions">
+            <button type="button" class="btn-text ob-skip">先跳过</button>
+            <button type="button" class="btn-primary" id="ob-engine-next">继续</button>
+          </div>
+        </div>
+
+        <div class="ob-step" data-step="3" hidden>
+          <h2 class="ob-title">授权权限</h2>
+          <div class="ob-perm">
+            <span class="ob-perm-name">辅助功能</span>
+            <span class="s-hint" id="ob-ax-status">检查中…</span>
+            <button type="button" class="btn-outline btn-xs" id="ob-ax-open">去授权</button>
+          </div>
+          <p class="s-hint">用于把识别结果打进其他应用的光标。授权后切回来会自动刷新状态</p>
+          <div class="ob-perm">
+            <span class="ob-perm-name">麦克风</span>
+            <span class="s-hint">首次录音时系统会弹窗询问，点「允许」即可</span>
+          </div>
+          <div class="ob-actions">
+            <button type="button" class="btn-primary ob-next">继续</button>
+          </div>
+        </div>
+
+        <div class="ob-step" data-step="4" hidden>
+          <h2 class="ob-title">试一句</h2>
+          <p class="ob-sub">点按下面的录音键，说一句「你好，NoType」，松开看看结果</p>
+          <button type="button" class="rec-btn ob-rec" id="ob-rec">
+            <span class="waveform">
+              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            </span>
+          </button>
+          <p class="ob-result" id="ob-result" hidden></p>
+          <div class="ob-actions">
+            <button type="button" class="btn-primary" id="ob-finish">完成，开始使用</button>
+          </div>
+        </div>
+
+        <div class="ob-dots" id="ob-dots"><i class="on"></i><i></i><i></i><i></i></div>
+      </div>
+    </div>
   </body>
 </html>

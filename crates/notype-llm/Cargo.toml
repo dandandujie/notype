@@ -1,16 +1,24 @@
 [package]
 name = "notype-llm"
-description = "LLM API client for voice recognition (Gemini, Qwen, MiMo)"
+description = "ASR + LLM clients for voice recognition (Qwen, Gemini, MiMo, Volcengine, Whisper-compatible, Apple Speech)"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 base64 = "0.22"
+flate2 = "1"
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-speech = "0.3"

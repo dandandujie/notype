@@ -1,17 +1,15 @@
 mod bubble;
+mod platform;
 mod tray;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
-use std::{path::PathBuf, process::Stdio};
 
-use base64::Engine;
 use notype_audio::Recorder;
 use notype_input::TextInputter;
 use notype_llm::VoiceRecognizer;
 use tauri::{Emitter, Manager};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 struct AppState {
     recorder: Arc<Recorder>,
@@ -24,56 +22,58 @@ struct AppState {
     /// True when the active capture session was started from the main window
     /// (dictation mode: result goes to clipboard + window, not typed).
     ui_capture: Arc<AtomicBool>,
+    /// True when the active capture is a voice-edit session (selection rewrite).
+    edit_session: Arc<AtomicBool>,
+    /// Instant of the last hotkey press (for tap-to-latch detection).
+    hotkey_pressed_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    /// Recording latched on by a quick tap; the next press stops it.
+    capture_latched: Arc<AtomicBool>,
+    /// Swallow the release event that follows a latch-stopping press.
+    swallow_release: Arc<AtomicBool>,
+    /// Frontmost app at capture start — powers per-app tone adaptation.
+    active_app: Arc<std::sync::Mutex<Option<String>>>,
     latest_interim_text: Arc<std::sync::Mutex<String>>,
-    doubao_gateway_process: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
+    /// Generation whose streaming ASR session has flushed its final text
+    /// into `latest_interim_text` (Volcengine live pipeline).
+    stream_final_gen: Arc<AtomicU64>,
 }
 
 const DEFAULT_POSTPROCESS_QWEN_MODEL: &str = "qwen3.5-omni-flash";
 const DEFAULT_POSTPROCESS_GEMINI_MODEL: &str = "gemini-3-flash-preview";
-const DEFAULT_LOCAL_DOUBAO_BASE_URL: &str = "http://127.0.0.1:8000";
-const DOUBAO_QUOTA_RETRY_ATTEMPTS: usize = 5;
-const DOUBAO_QUOTA_RETRY_BASE_DELAY_MS: u64 = 700;
+const DEFAULT_POSTPROCESS_MIMO_MODEL: &str = "mimo-v2.5";
 const POSTPROCESS_SYSTEM_PROMPT: &str = r#"你是实时语音转写后处理器。
 输入是 ASR 粗转写文本，请在不改变原意的前提下做语义和表达修正：
 - 修正同音/近音误识别，尤其是技术词汇、人名、品牌、代码术语
 - 补全标点与断句，优化段落与可读性
 - 清理明显口头语、重复词、改口残留（保持语义）
+- 说话人中途改口时（「不对」「我是说」「算了重说」），只保留最终意图
 - 保持原语言，不翻译
 - 只输出处理后的最终文本，不要解释"#;
 
-static DOUBAO_ASR_SERIAL_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-static DOUBAO_WS_ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
-static DOUBAO_WS_DISABLED: AtomicBool = AtomicBool::new(false);
+const POSTPROCESS_TRANSLATE_PROMPT: &str = r#"你是实时语音转写翻译器。
+输入是 ASR 粗转写文本，请把它翻译成地道、自然的英文：
+- 去除口水词、重复和改口残留，只翻译最终想表达的内容
+- 专有名词、品牌、代码术语保留原写法
+- 只输出英文译文，不要任何解释"#;
 
-fn doubao_asr_serial_mutex() -> &'static tokio::sync::Mutex<()> {
-    DOUBAO_ASR_SERIAL_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
-struct DoubaoWsSessionGuard;
-
-impl Drop for DoubaoWsSessionGuard {
-    fn drop(&mut self) {
-        let _ = DOUBAO_WS_ACTIVE_SESSIONS.fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |value| Some(value.saturating_sub(1)),
-        );
-    }
-}
-
-fn is_doubao_concurrency_quota_error(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    lower.contains("exceededconcurrentquota")
-        || lower.contains("concurrentquota")
-        || lower.contains("exceeded concurrent quota")
-        || lower.contains("concurrent quota exceeded")
-        || (lower.contains("concurrent") && lower.contains("quota"))
-}
-
-fn disable_doubao_ws_for_session() {
-    if !DOUBAO_WS_DISABLED.swap(true, Ordering::SeqCst) {
-        tracing::warn!("Disable Doubao realtime WS for this app session after quota error");
-    }
+/// Compose the system prompt for the current session: output style preset +
+/// user prompts + (if enabled) the frontmost-app tone context.
+fn compose_session_prompt(app: &tauri::AppHandle, cfg: &notype_config::AppConfig) -> String {
+    let state = app.state::<AppState>();
+    let active = state.active_app.lock().ok().and_then(|g| g.clone());
+    let app_ctx: Option<(String, String)> = if cfg.general.enable_app_context {
+        active.map(|name| {
+            let tone = notype_config::resolve_app_tone(&name, &cfg.general.app_rules);
+            (name, tone)
+        })
+    } else {
+        None
+    };
+    cfg.prompts.compose_for(
+        &cfg.general.output_style,
+        app_ctx.as_ref().map(|(a, t)| (a.as_str(), t.as_str())),
+        cfg.general.structured_output,
+    )
 }
 
 fn read_cached_interim_text(latest_interim_text: &std::sync::Mutex<String>) -> String {
@@ -84,64 +84,12 @@ fn read_cached_interim_text(latest_interim_text: &std::sync::Mutex<String>) -> S
         .unwrap_or_default()
 }
 
-async fn wait_for_doubao_ws_idle(max_wait: std::time::Duration) -> bool {
-    if DOUBAO_WS_ACTIVE_SESSIONS.load(Ordering::SeqCst) == 0 {
-        return true;
-    }
-
-    let deadline = Instant::now() + max_wait;
-    while Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        if DOUBAO_WS_ACTIVE_SESSIONS.load(Ordering::SeqCst) == 0 {
-            return true;
-        }
-    }
-
-    DOUBAO_WS_ACTIVE_SESSIONS.load(Ordering::SeqCst) == 0
-}
-
-async fn wait_for_nonempty_interim_text(
-    latest_interim_text: &std::sync::Mutex<String>,
-    max_wait: std::time::Duration,
-) -> String {
-    let current = read_cached_interim_text(latest_interim_text);
-    if !current.is_empty() {
-        return current;
-    }
-
-    let deadline = Instant::now() + max_wait;
-    while Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        let next = read_cached_interim_text(latest_interim_text);
-        if !next.is_empty() {
-            return next;
-        }
-    }
-
-    String::new()
-}
 
 #[derive(Clone)]
 struct PostprocessSpec {
-    provider: notype_llm::Provider,
-    api_key: String,
-    model_name: String,
-}
-
-#[derive(serde::Serialize)]
-struct DoubaoBridgeInMessage<'a> {
-    #[serde(rename = "type")]
-    kind: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pcm_b64: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct DoubaoBridgeOutMessage {
-    #[serde(rename = "type")]
-    kind: String,
-    text: Option<String>,
-    message: Option<String>,
+    target: notype_llm::TextLlmTarget,
+    /// Style-dependent postprocess instruction (polish / translate / …).
+    system_prompt: String,
 }
 
 // -- Frontend event payloads --
@@ -217,8 +165,9 @@ fn is_recording(state: tauri::State<'_, AppState>) -> bool {
 
 /// Start a capture session. `from_ui = true` means dictation mode started
 /// from the main window: the window stays visible, no bubble is shown, and
-/// the final text is copied instead of typed.
-fn start_capture(app: &tauri::AppHandle, from_ui: bool) -> Result<(), String> {
+/// the final text is copied instead of typed. `edit = true` means voice-edit:
+/// the user has text selected and is speaking an instruction.
+fn start_capture(app: &tauri::AppHandle, from_ui: bool, edit: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
     if state.recorder.is_recording() {
         return Err("已在录音中".into());
@@ -229,6 +178,22 @@ fn start_capture(app: &tauri::AppHandle, from_ui: bool) -> Result<(), String> {
         guard.clear();
     }
     state.ui_capture.store(from_ui, Ordering::SeqCst);
+    state.edit_session.store(edit, Ordering::SeqCst);
+
+    // Capture the target app BEFORE hiding our window — this powers the
+    // per-app tone adaptation. UI dictation goes to the clipboard, so the
+    // frontmost app (NoType itself) carries no context there.
+    let frontmost = if from_ui {
+        None
+    } else {
+        platform::frontmost_app_name().filter(|name| name != "NoType" && name != "notype")
+    };
+    if let Some(name) = frontmost.as_deref() {
+        tracing::info!(app = %name, "Capture context: frontmost app");
+    }
+    if let Ok(mut guard) = state.active_app.lock() {
+        *guard = frontmost;
+    }
 
     if !from_ui {
         if let Some(window) = app.get_webview_window("main") {
@@ -245,24 +210,47 @@ fn start_capture(app: &tauri::AppHandle, from_ui: bool) -> Result<(), String> {
     }
     emit_status(app, "Recording", None);
 
-    let rec_clone = Arc::clone(&state.recorder);
-    let recognizer = Arc::clone(&state.recognizer);
-    let cfg = Arc::clone(&state.config);
-    let handle = app.clone();
-    let gen = Arc::clone(&state.bubble_generation);
-    let latest_interim_text = Arc::clone(&state.latest_interim_text);
-    let gen_val = gen.load(Ordering::SeqCst);
+    // Voice-edit commands are short — no interim preview loop for them.
+    let gen_val = state.bubble_generation.load(Ordering::SeqCst);
+    if !edit {
+        let rec_clone = Arc::clone(&state.recorder);
+        let recognizer = Arc::clone(&state.recognizer);
+        let cfg = Arc::clone(&state.config);
+        let handle = app.clone();
+        let gen = Arc::clone(&state.bubble_generation);
+        let latest_interim_text = Arc::clone(&state.latest_interim_text);
+        state.runtime.spawn(async move {
+            interim_loop(
+                handle,
+                rec_clone,
+                recognizer,
+                cfg,
+                latest_interim_text,
+                gen,
+                gen_val,
+            )
+            .await;
+        });
+    }
+
+    // Live input-level meter: drives the real waveform in bubble + window.
+    let rec_level = Arc::clone(&state.recorder);
+    let gen_level = Arc::clone(&state.bubble_generation);
+    let handle_level = app.clone();
     state.runtime.spawn(async move {
-        interim_loop(
-            handle,
-            rec_clone,
-            recognizer,
-            cfg,
-            latest_interim_text,
-            gen,
-            gen_val,
-        )
-        .await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(80));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if gen_level.load(Ordering::SeqCst) != gen_val || !rec_level.is_recording() {
+                break;
+            }
+            let level = rec_level.input_level();
+            let _ = handle_level.emit("notype://level", level);
+            bubble::set_level(&handle_level, level);
+        }
+        let _ = handle_level.emit("notype://level", 0.0f32);
+        bubble::set_level(&handle_level, 0.0);
     });
 
     Ok(())
@@ -282,7 +270,9 @@ fn stop_capture(app: &tauri::AppHandle) -> Result<(), String> {
         "Audio captured"
     );
 
+    state.capture_latched.store(false, Ordering::SeqCst);
     let from_ui = state.ui_capture.load(Ordering::SeqCst);
+    let edit = state.edit_session.load(Ordering::SeqCst);
     if !from_ui {
         bubble::set_recognizing(app);
     }
@@ -293,21 +283,25 @@ fn stop_capture(app: &tauri::AppHandle) -> Result<(), String> {
     let inputter = Arc::clone(&state.inputter);
     let gen = Arc::clone(&state.bubble_generation);
     let latest_interim_text = Arc::clone(&state.latest_interim_text);
-    let gateway_process = Arc::clone(&state.doubao_gateway_process);
+    let stream_final_gen = Arc::clone(&state.stream_final_gen);
     let handle = app.clone();
     state.runtime.spawn(async move {
-        process_audio(
-            &handle,
-            &recognizer,
-            &cfg,
-            &inputter,
-            gateway_process,
-            latest_interim_text.as_ref(),
-            &gen,
-            audio,
-            from_ui,
-        )
-        .await;
+        if edit {
+            process_edit_audio(&handle, &recognizer, &cfg, &inputter, &gen, audio).await;
+        } else {
+            process_audio(
+                &handle,
+                &recognizer,
+                &cfg,
+                &inputter,
+                latest_interim_text.as_ref(),
+                stream_final_gen.as_ref(),
+                &gen,
+                audio,
+                from_ui,
+            )
+            .await;
+        }
     });
 
     Ok(())
@@ -325,9 +319,233 @@ fn cancel_capture(app: &tauri::AppHandle) {
         guard.clear();
     }
     state.hotkey_down.store(false, Ordering::SeqCst);
+    state.edit_session.store(false, Ordering::SeqCst);
+    state.capture_latched.store(false, Ordering::SeqCst);
     bubble::hide_bubble(app);
     emit_status(app, "Ready", None);
     tracing::info!("Capture cancelled by user");
+}
+
+// -- Voice edit (Typeless "speak to edit selected text") --
+
+fn edit_system_prompt(selection: &str) -> String {
+    format!(
+        "你是一个文本编辑引擎。用户选中了一段文本，并通过语音说出编辑指令。\n\
+         请严格按照指令处理选中的文本：\n\
+         - 修改类指令（改写、缩短、扩写、换语气、翻译、改格式等）：输出修改后的完整文本\n\
+         - 提问类指令（总结、解释这段话等）：输出针对该文本的回答\n\
+         - 只输出结果文本本身，不要任何解释、前缀或引号包裹\n\
+         - 除非指令要求翻译，否则保持选中文本的原语言\n\n\
+         ## 选中的文本\n{selection}"
+    )
+}
+
+/// Pull the user's current selection via a synthetic copy chord.
+/// Called after the hotkey is released so held modifiers can't corrupt the chord.
+async fn capture_selection(inputter: &TextInputter) -> String {
+    if inputter.send_copy_shortcut().is_err() {
+        return String::new();
+    }
+    // Give the target app a beat to service the copy.
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+    inputter.read_text().unwrap_or_default()
+}
+
+/// Pick the text LLM used for polish/edit passes, honoring the configured
+/// preference. `Custom` accepts any OpenAI-compatible vendor.
+fn choose_text_llm(cfg: &notype_config::AppConfig) -> Option<notype_llm::TextLlmTarget> {
+    use notype_llm::{TextLlmKind, TextLlmTarget};
+
+    let custom = || -> Option<TextLlmTarget> {
+        let base_url = cfg.model.custom_llm_base_url.trim();
+        let model = cfg.model.custom_llm_model.trim();
+        if base_url.is_empty() || model.is_empty() {
+            return None;
+        }
+        Some(TextLlmTarget {
+            kind: TextLlmKind::OpenAiCompatible,
+            api_key: cfg.model.custom_llm_api_key.clone(),
+            model: model.to_string(),
+            base_url: Some(base_url.to_string()),
+        })
+    };
+
+    let qwen = || -> Option<TextLlmTarget> {
+        // Local Qwen endpoints may be keyless.
+        if cfg.model.qwen_api_key.is_empty() && !cfg.model.qwen_is_custom_endpoint() {
+            return None;
+        }
+        let model = if cfg.model.model_name.starts_with("qwen")
+            && !cfg.model.model_name.contains("asr")
+        {
+            cfg.model.model_name.clone()
+        } else {
+            DEFAULT_POSTPROCESS_QWEN_MODEL.to_string()
+        };
+        Some(TextLlmTarget {
+            kind: TextLlmKind::OpenAiCompatible,
+            api_key: cfg.model.qwen_api_key.clone(),
+            model,
+            base_url: Some(cfg.model.qwen_base_url.clone()),
+        })
+    };
+
+    let gemini = || -> Option<TextLlmTarget> {
+        if cfg.model.gemini_api_key.is_empty() {
+            return None;
+        }
+        let model = if cfg.model.model_name.starts_with("gemini") {
+            cfg.model.model_name.clone()
+        } else {
+            DEFAULT_POSTPROCESS_GEMINI_MODEL.to_string()
+        };
+        Some(TextLlmTarget {
+            kind: TextLlmKind::Gemini,
+            api_key: cfg.model.gemini_api_key.clone(),
+            model,
+            base_url: None,
+        })
+    };
+
+    let mimo = || -> Option<TextLlmTarget> {
+        if cfg.model.mimo_api_key.is_empty() {
+            return None;
+        }
+        Some(TextLlmTarget {
+            kind: TextLlmKind::Mimo,
+            api_key: cfg.model.mimo_api_key.clone(),
+            model: DEFAULT_POSTPROCESS_MIMO_MODEL.to_string(),
+            base_url: Some(cfg.model.mimo_base_url.clone()),
+        })
+    };
+
+    match cfg.model.postprocess_provider {
+        notype_config::PostprocessProvider::Custom => custom(),
+        notype_config::PostprocessProvider::Qwen => qwen(),
+        notype_config::PostprocessProvider::Gemini => gemini(),
+        notype_config::PostprocessProvider::Mimo => mimo(),
+        notype_config::PostprocessProvider::Auto => custom()
+            .or_else(qwen)
+            .or_else(gemini)
+            .or_else(mimo),
+    }
+}
+
+async fn process_edit_audio(
+    app: &tauri::AppHandle,
+    recognizer: &tokio::sync::RwLock<Option<Box<dyn VoiceRecognizer>>>,
+    config: &tokio::sync::RwLock<notype_config::AppConfig>,
+    inputter: &TextInputter,
+    generation: &AtomicU64,
+    audio: notype_audio::AudioData,
+) {
+    let gen_at_start = generation.load(Ordering::SeqCst);
+
+    let fail = |app: &tauri::AppHandle, msg: &str| {
+        bubble::set_error(app, msg);
+        emit_status(app, "Error", Some(msg));
+    };
+
+    let selection = capture_selection(inputter).await;
+    if selection.trim().is_empty() {
+        tracing::warn!("Voice edit: no selection captured");
+        fail(app, "未检测到选中文本");
+        auto_hide_bubble(app, generation, gen_at_start, 3).await;
+        emit_status(app, "Ready", None);
+        return;
+    }
+    tracing::info!(
+        chars = selection.chars().count(),
+        "Voice edit: selection captured"
+    );
+
+    let (is_asr, model_name, text_target) = {
+        let cfg = config.read().await;
+        (
+            cfg.model.is_asr_pipeline(),
+            cfg.model.model_name.clone(),
+            choose_text_llm(&cfg),
+        )
+    };
+    let system_prompt = edit_system_prompt(&selection);
+
+    let edited: Result<String, String> = {
+        let guard = recognizer.read().await;
+        let Some(rec) = guard.as_ref() else {
+            fail(app, "未配置识别引擎");
+            auto_hide_bubble(app, generation, gen_at_start, 3).await;
+            emit_status(app, "Ready", None);
+            return;
+        };
+
+        if is_asr {
+            // ASR engines can't follow instructions: transcribe the spoken
+            // command first, then apply it with a text-capable LLM.
+            let asr_result = rec
+                .recognize(
+                    audio.wav_bytes.clone(),
+                    "audio/wav".into(),
+                    "转录这段语音指令，只输出文字。".into(),
+                )
+                .await;
+            drop(guard);
+
+            match asr_result {
+                Ok(r) if !r.text.trim().is_empty() => {
+                    if let Some(target) = text_target {
+                        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                        notype_llm::postprocess_text_stream_to(
+                            &target,
+                            system_prompt,
+                            r.text,
+                            tx,
+                        )
+                        .await
+                        .map(|out| out.text)
+                        .map_err(|e| e.to_string())
+                    } else {
+                        Err("语音编辑需要配置润色 LLM（自定义 / Qwen / Gemini / MiMo）".into())
+                    }
+                }
+                Ok(_) => Err("没有听到编辑指令".into()),
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            rec.recognize(audio.wav_bytes.clone(), "audio/wav".into(), system_prompt)
+                .await
+                .map(|r| r.text)
+                .map_err(|e| e.to_string())
+        }
+    };
+
+    match edited {
+        Ok(text) if !text.trim().is_empty() => {
+            let ctx = FinalizeCtx {
+                from_ui: false,
+                // Paste atomically replaces the still-active selection.
+                input_mode: notype_config::InputMode::Clipboard,
+                auto_copy: false,
+                auto_enter: false,
+                replace_rules: String::new(),
+                provider_label: "语音编辑".to_string(),
+                model_name,
+                duration_secs: audio.duration_secs,
+            };
+            emit_final_text(app, inputter, generation, gen_at_start, text.trim(), "", &ctx)
+                .await;
+        }
+        Ok(_) => {
+            tracing::info!("Voice edit produced empty result");
+            bubble::hide_bubble(app);
+            emit_status(app, "Ready", None);
+        }
+        Err(e) => {
+            tracing::error!("Voice edit failed: {e}");
+            fail(app, &e);
+            auto_hide_bubble(app, generation, gen_at_start, 5).await;
+            emit_status(app, "Ready", None);
+        }
+    }
 }
 
 /// Toggle dictation from the main window. Returns `true` if now recording.
@@ -337,7 +555,7 @@ fn toggle_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) ->
         stop_capture(&app)?;
         Ok(false)
     } else {
-        start_capture(&app, true)?;
+        start_capture(&app, true, false)?;
         Ok(true)
     }
 }
@@ -345,6 +563,168 @@ fn toggle_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) ->
 #[tauri::command]
 fn cancel_recording(app: tauri::AppHandle) {
     cancel_capture(&app);
+}
+
+// -- Stats --
+
+#[derive(Clone, serde::Serialize)]
+struct StatsDto {
+    total_chars: u64,
+    total_duration_secs: f64,
+    total_sessions: u64,
+    streak_days: u32,
+    learned_pairs: u64,
+}
+
+impl StatsDto {
+    fn from(stats: &notype_config::stats::Stats) -> Self {
+        Self {
+            total_chars: stats.total_chars,
+            total_duration_secs: stats.total_duration_secs,
+            total_sessions: stats.total_sessions,
+            streak_days: notype_config::stats::effective_streak(stats),
+            learned_pairs: stats.learned_pairs,
+        }
+    }
+}
+
+#[tauri::command]
+fn get_stats() -> StatsDto {
+    StatsDto::from(&notype_config::stats::load())
+}
+
+/// Quick style switch from the home view — persists without a full save.
+#[tauri::command]
+async fn set_output_style(state: tauri::State<'_, AppState>, style: String) -> Result<(), String> {
+    let mut config = state.config.write().await;
+    config.general.output_style = match style.as_str() {
+        "verbatim" => notype_config::OutputStyle::Verbatim,
+        "translate_en" => notype_config::OutputStyle::TranslateEn,
+        _ => notype_config::OutputStyle::Polish,
+    };
+    notype_config::save(&config).map_err(|e| e.to_string())
+}
+
+/// Onboarding: set provider (+key) with one call and rebuild the recognizer.
+#[tauri::command]
+async fn quick_setup(
+    state: tauri::State<'_, AppState>,
+    provider: String,
+    api_key: String,
+) -> Result<(), String> {
+    let mut config = state.config.write().await;
+    config.model.provider = match provider.to_lowercase().as_str() {
+        "qwen" => notype_config::Provider::Qwen,
+        "gemini" => notype_config::Provider::Gemini,
+        "mimo" => notype_config::Provider::Mimo,
+        "volcengine" => notype_config::Provider::Volcengine,
+        "whisper" => notype_config::Provider::Whisper,
+        "apple" => notype_config::Provider::Apple,
+        other => return Err(format!("未知引擎: {other}")),
+    };
+    // Sensible default model per provider.
+    match config.model.provider {
+        notype_config::Provider::Qwen => config.model.model_name = "qwen3.5-omni-flash".into(),
+        notype_config::Provider::Gemini => {
+            config.model.model_name = "gemini-3-flash-preview".into()
+        }
+        notype_config::Provider::Mimo => config.model.model_name = "mimo-v2.5-asr".into(),
+        _ => {}
+    }
+    let key = api_key.trim();
+    if !key.is_empty() {
+        match config.model.provider {
+            notype_config::Provider::Qwen => config.model.qwen_api_key = key.to_string(),
+            notype_config::Provider::Gemini => config.model.gemini_api_key = key.to_string(),
+            notype_config::Provider::Mimo => config.model.mimo_api_key = key.to_string(),
+            notype_config::Provider::Whisper => config.model.whisper_api_key = key.to_string(),
+            _ => {}
+        }
+    }
+    notype_config::save(&config).map_err(|e| e.to_string())?;
+
+    let new_recognizer = build_recognizer(&config);
+    drop(config);
+    let mut rec = state.recognizer.write().await;
+    *rec = new_recognizer;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mark_onboarded(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut config = state.config.write().await;
+    config.general.onboarded = true;
+    notype_config::save(&config).map_err(|e| e.to_string())
+}
+
+/// Export the transcription history as Markdown into ~/Downloads.
+/// Returns the written file path.
+#[tauri::command]
+fn export_history() -> Result<String, String> {
+    let entries = notype_config::history::load();
+    if entries.is_empty() {
+        return Err("没有可导出的历史记录".into());
+    }
+
+    let mut out = String::from("# NoType 转写历史\n");
+    let mut last_day = String::new();
+    for entry in &entries {
+        let secs = entry.id / 1000;
+        let datetime = chrono::DateTime::from_timestamp(secs as i64, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local));
+        let (day, time) = match datetime {
+            Some(dt) => (
+                dt.format("%Y-%m-%d").to_string(),
+                dt.format("%H:%M").to_string(),
+            ),
+            None => (String::from("未知日期"), String::new()),
+        };
+        if day != last_day {
+            out.push_str(&format!("\n## {day}\n\n"));
+            last_day = day;
+        }
+        out.push_str(&format!(
+            "- **{time}**（{}）{}\n",
+            entry.provider,
+            entry.text.replace('\n', " ")
+        ));
+    }
+
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "找不到下载目录".to_string())?;
+    let filename = format!(
+        "notype-history-{}.md",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let path = dir.join(filename);
+    std::fs::write(&path, out).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+// -- Permissions --
+
+#[derive(Clone, serde::Serialize)]
+struct PermissionsDto {
+    accessibility: bool,
+}
+
+#[tauri::command]
+fn check_permissions() -> PermissionsDto {
+    PermissionsDto {
+        accessibility: platform::accessibility_trusted(),
+    }
+}
+
+#[tauri::command]
+fn open_accessibility_settings(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    if platform::ACCESSIBILITY_SETTINGS_URL.is_empty() {
+        return Ok(());
+    }
+    app.opener()
+        .open_url(platform::ACCESSIBILITY_SETTINGS_URL, None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 // -- History --
@@ -357,6 +737,68 @@ fn get_history() -> Vec<notype_config::history::HistoryEntry> {
 #[tauri::command]
 fn delete_history_entry(id: u64) -> Result<Vec<notype_config::history::HistoryEntry>, String> {
     notype_config::history::delete(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_history_entry(
+    id: u64,
+    text: String,
+) -> Result<Vec<notype_config::history::HistoryEntry>, String> {
+    notype_config::history::update_text(id, &text).map_err(|e| e.to_string())
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct VocabPair {
+    wrong: String,
+    right: String,
+}
+
+/// Dictionary auto-learning: append correction pairs extracted from a user
+/// edit to the vocabulary prompt. Returns how many were actually new.
+#[tauri::command]
+async fn learn_vocabulary(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    pairs: Vec<VocabPair>,
+) -> Result<usize, String> {
+    if pairs.is_empty() {
+        return Ok(0);
+    }
+
+    let mut config = state.config.write().await;
+    // Materialize the effective text so builtin defaults survive the append.
+    let mut vocab = config.prompts.vocabulary_text().to_string();
+
+    let mut added = 0usize;
+    for pair in &pairs {
+        let (wrong, right) = (pair.wrong.trim(), pair.right.trim());
+        if wrong.is_empty() || right.is_empty() || wrong == right {
+            continue;
+        }
+        let line = format!("- {wrong} → {right}");
+        if vocab.lines().any(|l| l.trim() == line) {
+            continue;
+        }
+        vocab = format!("{}\n{line}", vocab.trim_end());
+        added += 1;
+    }
+
+    if added == 0 {
+        return Ok(0);
+    }
+
+    config.prompts.vocabulary = vocab;
+    notype_config::save(&config).map_err(|e| e.to_string())?;
+    drop(config);
+
+    match notype_config::stats::record_learned(added) {
+        Ok(stats) => {
+            let _ = app.emit("notype://stats", StatsDto::from(&stats));
+        }
+        Err(e) => tracing::warn!("Failed to record learned pairs: {e}"),
+    }
+    tracing::info!(added, "Vocabulary auto-learned from user edit");
+    Ok(added)
 }
 
 #[tauri::command]
@@ -419,6 +861,7 @@ async fn get_prompts(state: tauri::State<'_, AppState>) -> Result<PromptsDto, St
         agent: config.prompts.agent_text().to_string(),
         rules: config.prompts.rules_text().to_string(),
         vocabulary: config.prompts.vocabulary_text().to_string(),
+        replace_rules: config.prompts.replace_rules.clone(),
     })
 }
 
@@ -428,6 +871,7 @@ async fn save_prompts(state: tauri::State<'_, AppState>, dto: PromptsDto) -> Res
     config.prompts.agent = dto.agent;
     config.prompts.rules = dto.rules;
     config.prompts.vocabulary = dto.vocabulary;
+    config.prompts.replace_rules = dto.replace_rules;
     notype_config::save(&config).map_err(|e| e.to_string())?;
     tracing::info!("Prompts saved");
     Ok(())
@@ -439,6 +883,7 @@ fn get_builtin_prompts() -> PromptsDto {
         agent: notype_config::builtin_prompts::AGENT.to_string(),
         rules: notype_config::builtin_prompts::RULES.to_string(),
         vocabulary: notype_config::builtin_prompts::VOCABULARY.to_string(),
+        replace_rules: String::new(),
     }
 }
 
@@ -456,12 +901,15 @@ async fn save_config(
 ) -> Result<SaveResult, String> {
     let mut config = state.config.write().await;
 
-    let hotkey_changed = config.general.hotkey != dto.hotkey;
+    let hotkey_changed = config.general.hotkey != dto.hotkey
+        || config.general.edit_hotkey != dto.edit_hotkey;
 
     config.model.provider = match dto.provider.to_lowercase().as_str() {
         "qwen" => notype_config::Provider::Qwen,
         "mimo" | "xiaomi" => notype_config::Provider::Mimo,
-        "doubao" => notype_config::Provider::Doubao,
+        "volcengine" | "volc" | "doubao" => notype_config::Provider::Volcengine,
+        "whisper" | "openai" => notype_config::Provider::Whisper,
+        "apple" => notype_config::Provider::Apple,
         _ => notype_config::Provider::Gemini,
     };
     if !dto.gemini_api_key.is_empty() {
@@ -470,42 +918,67 @@ async fn save_config(
     if !dto.qwen_api_key.is_empty() {
         config.model.qwen_api_key = dto.qwen_api_key;
     }
+    if !dto.qwen_base_url.trim().is_empty() {
+        config.model.qwen_base_url = dto.qwen_base_url.trim().to_string();
+    }
     if !dto.mimo_api_key.is_empty() {
         config.model.mimo_api_key = dto.mimo_api_key;
     }
     if !dto.mimo_base_url.trim().is_empty() {
         config.model.mimo_base_url = dto.mimo_base_url;
     }
-    if !dto.doubao_api_key.is_empty() {
-        config.model.doubao_api_key = dto.doubao_api_key;
+    if !dto.volc_app_key.is_empty() {
+        config.model.volc_app_key = dto.volc_app_key;
     }
-    if !dto.doubao_base_url.trim().is_empty() {
-        config.model.doubao_base_url = dto.doubao_base_url;
+    if !dto.volc_access_key.is_empty() {
+        config.model.volc_access_key = dto.volc_access_key;
     }
-    if !dto.doubao_official_app_key.is_empty() {
-        config.model.doubao_official_app_key = dto.doubao_official_app_key;
+    if !dto.volc_resource_id.trim().is_empty() {
+        config.model.volc_resource_id = dto.volc_resource_id.trim().to_string();
     }
-    if !dto.doubao_official_access_key.is_empty() {
-        config.model.doubao_official_access_key = dto.doubao_official_access_key;
+    if !dto.whisper_base_url.trim().is_empty() {
+        config.model.whisper_base_url = dto.whisper_base_url.trim().to_string();
     }
-    config.model.enable_doubao_postprocess = dto.enable_doubao_postprocess;
-    config.model.doubao_postprocess_provider = match dto.doubao_postprocess_provider.as_str() {
-        "qwen" => notype_config::DoubaoPostprocessProvider::Qwen,
-        "gemini" => notype_config::DoubaoPostprocessProvider::Gemini,
-        _ => notype_config::DoubaoPostprocessProvider::Auto,
+    if !dto.whisper_api_key.is_empty() {
+        config.model.whisper_api_key = dto.whisper_api_key;
+    }
+    if !dto.whisper_model.trim().is_empty() {
+        config.model.whisper_model = dto.whisper_model.trim().to_string();
+    }
+    config.model.apple_locale = dto.apple_locale.trim().to_string();
+    config.model.enable_postprocess = dto.enable_postprocess;
+    config.model.postprocess_provider = match dto.postprocess_provider.as_str() {
+        "custom" => notype_config::PostprocessProvider::Custom,
+        "qwen" => notype_config::PostprocessProvider::Qwen,
+        "gemini" => notype_config::PostprocessProvider::Gemini,
+        "mimo" => notype_config::PostprocessProvider::Mimo,
+        _ => notype_config::PostprocessProvider::Auto,
     };
-    config.model.enable_doubao_realtime_ws = dto.enable_doubao_realtime_ws;
-    if !dto.doubao_ime_credential_path.trim().is_empty() {
-        config.model.doubao_ime_credential_path = dto.doubao_ime_credential_path;
+    config.model.custom_llm_base_url = dto.custom_llm_base_url.trim().to_string();
+    if !dto.custom_llm_api_key.is_empty() {
+        config.model.custom_llm_api_key = dto.custom_llm_api_key;
     }
+    config.model.custom_llm_model = dto.custom_llm_model.trim().to_string();
     config.model.model_name = dto.model_name;
     config.general.hotkey = dto.hotkey.clone();
+    config.general.edit_hotkey = dto.edit_hotkey.trim().to_string();
     config.general.audio_device = dto.audio_device.trim().to_string();
     config.general.input_mode = match dto.input_mode.to_lowercase().as_str() {
         "clipboard" => notype_config::InputMode::Clipboard,
         _ => notype_config::InputMode::Keyboard,
     };
     config.general.auto_copy = dto.auto_copy;
+    config.general.output_style = match dto.output_style.as_str() {
+        "verbatim" => notype_config::OutputStyle::Verbatim,
+        "translate_en" => notype_config::OutputStyle::TranslateEn,
+        _ => notype_config::OutputStyle::Polish,
+    };
+    config.general.enable_app_context = dto.enable_app_context;
+    config.general.structured_output = dto.structured_output;
+    config.general.stream_typing = dto.stream_typing;
+    config.general.sound_feedback = dto.sound_feedback;
+    config.general.auto_enter = dto.auto_enter;
+    config.general.app_rules = dto.app_rules;
 
     notype_config::save(&config).map_err(|e| e.to_string())?;
 
@@ -523,25 +996,9 @@ async fn save_config(
     *rec = new_recognizer;
     drop(rec);
 
-    let cfg_snapshot = state.config.read().await.clone();
-    if should_manage_local_doubao_gateway(&cfg_snapshot) {
-        let gateway = Arc::clone(&state.doubao_gateway_process);
-        let base_url = cfg_snapshot.model.doubao_base_url.clone();
-        let credential_path = cfg_snapshot.model.doubao_ime_credential_path.clone();
-        let api_key = cfg_snapshot.model.doubao_api_key.clone();
-        state.runtime.spawn(async move {
-            if let Err(e) =
-                ensure_local_doubao_gateway_running(gateway, base_url, credential_path, api_key)
-                    .await
-            {
-                tracing::warn!("Failed to auto-start local doubao-asr2api gateway: {e}");
-            }
-        });
-    }
-
     // Re-register shortcut if changed
     if hotkey_changed {
-        if let Err(e) = reregister_shortcut(&app, &dto.hotkey) {
+        if let Err(e) = reregister_shortcut(&app, &dto.hotkey, &dto.edit_hotkey) {
             tracing::error!(error = %e, "Failed to update hotkey, restart required");
             return Ok(SaveResult {
                 restart_needed: true,
@@ -561,6 +1018,8 @@ struct PromptsDto {
     agent: String,
     rules: String,
     vocabulary: String,
+    #[serde(default)]
+    replace_rules: String,
 }
 
 /// DTO for frontend config exchange. Keys are never sent back — only has_* flags.
@@ -569,30 +1028,69 @@ struct ConfigDto {
     provider: String,
     gemini_api_key: String,
     qwen_api_key: String,
+    #[serde(default)]
+    qwen_base_url: String,
     mimo_api_key: String,
     mimo_base_url: String,
-    doubao_api_key: String,
-    doubao_base_url: String,
-    doubao_official_app_key: String,
-    doubao_official_access_key: String,
-    enable_doubao_postprocess: bool,
-    doubao_postprocess_provider: String,
-    enable_doubao_realtime_ws: bool,
-    doubao_ime_credential_path: String,
+    #[serde(default)]
+    volc_app_key: String,
+    #[serde(default)]
+    volc_access_key: String,
+    #[serde(default)]
+    volc_resource_id: String,
+    #[serde(default)]
+    whisper_base_url: String,
+    #[serde(default)]
+    whisper_api_key: String,
+    #[serde(default)]
+    whisper_model: String,
+    #[serde(default)]
+    apple_locale: String,
+    #[serde(default)]
+    enable_postprocess: bool,
+    #[serde(default)]
+    postprocess_provider: String,
+    #[serde(default)]
+    custom_llm_base_url: String,
+    #[serde(default)]
+    custom_llm_api_key: String,
+    #[serde(default)]
+    custom_llm_model: String,
     model_name: String,
     hotkey: String,
+    #[serde(default)]
+    edit_hotkey: String,
     #[serde(default)]
     audio_device: String,
     #[serde(default)]
     input_mode: String,
     #[serde(default)]
     auto_copy: bool,
+    #[serde(default)]
+    output_style: String,
+    #[serde(default)]
+    enable_app_context: bool,
+    #[serde(default)]
+    structured_output: bool,
+    #[serde(default)]
+    stream_typing: bool,
+    #[serde(default)]
+    sound_feedback: bool,
+    #[serde(default)]
+    auto_enter: bool,
+    #[serde(default)]
+    app_rules: String,
+    #[serde(default)]
+    onboarded: bool,
     has_gemini_key: bool,
     has_qwen_key: bool,
     has_mimo_key: bool,
-    has_doubao_key: bool,
-    has_doubao_official_app_key: bool,
-    has_doubao_official_access_key: bool,
+    #[serde(default)]
+    has_volc_keys: bool,
+    #[serde(default)]
+    has_whisper_key: bool,
+    #[serde(default)]
+    has_custom_llm_key: bool,
 }
 
 impl ConfigDto {
@@ -601,29 +1099,39 @@ impl ConfigDto {
             notype_config::Provider::Gemini => "gemini",
             notype_config::Provider::Qwen => "qwen",
             notype_config::Provider::Mimo => "mimo",
-            notype_config::Provider::Doubao => "doubao",
+            notype_config::Provider::Volcengine => "volcengine",
+            notype_config::Provider::Whisper => "whisper",
+            notype_config::Provider::Apple => "apple",
         };
         Self {
             provider: provider.into(),
             gemini_api_key: String::new(),
             qwen_api_key: String::new(),
+            qwen_base_url: config.model.qwen_base_url.clone(),
             mimo_api_key: String::new(),
             mimo_base_url: config.model.mimo_base_url.clone(),
-            doubao_api_key: String::new(),
-            doubao_base_url: config.model.doubao_base_url.clone(),
-            doubao_official_app_key: String::new(),
-            doubao_official_access_key: String::new(),
-            enable_doubao_postprocess: config.model.enable_doubao_postprocess,
-            doubao_postprocess_provider: match config.model.doubao_postprocess_provider {
-                notype_config::DoubaoPostprocessProvider::Auto => "auto",
-                notype_config::DoubaoPostprocessProvider::Qwen => "qwen",
-                notype_config::DoubaoPostprocessProvider::Gemini => "gemini",
+            volc_app_key: String::new(),
+            volc_access_key: String::new(),
+            volc_resource_id: config.model.volc_resource_id.clone(),
+            whisper_base_url: config.model.whisper_base_url.clone(),
+            whisper_api_key: String::new(),
+            whisper_model: config.model.whisper_model.clone(),
+            apple_locale: config.model.apple_locale.clone(),
+            enable_postprocess: config.model.enable_postprocess,
+            postprocess_provider: match config.model.postprocess_provider {
+                notype_config::PostprocessProvider::Auto => "auto",
+                notype_config::PostprocessProvider::Custom => "custom",
+                notype_config::PostprocessProvider::Qwen => "qwen",
+                notype_config::PostprocessProvider::Gemini => "gemini",
+                notype_config::PostprocessProvider::Mimo => "mimo",
             }
             .to_string(),
-            enable_doubao_realtime_ws: config.model.enable_doubao_realtime_ws,
-            doubao_ime_credential_path: config.model.doubao_ime_credential_path.clone(),
+            custom_llm_base_url: config.model.custom_llm_base_url.clone(),
+            custom_llm_api_key: String::new(),
+            custom_llm_model: config.model.custom_llm_model.clone(),
             model_name: config.model.model_name.clone(),
             hotkey: config.general.hotkey.clone(),
+            edit_hotkey: config.general.edit_hotkey.clone(),
             audio_device: config.general.audio_device.clone(),
             input_mode: match config.general.input_mode {
                 notype_config::InputMode::Keyboard => "keyboard",
@@ -631,12 +1139,26 @@ impl ConfigDto {
             }
             .to_string(),
             auto_copy: config.general.auto_copy,
+            output_style: match config.general.output_style {
+                notype_config::OutputStyle::Polish => "polish",
+                notype_config::OutputStyle::Verbatim => "verbatim",
+                notype_config::OutputStyle::TranslateEn => "translate_en",
+            }
+            .to_string(),
+            enable_app_context: config.general.enable_app_context,
+            structured_output: config.general.structured_output,
+            stream_typing: config.general.stream_typing,
+            sound_feedback: config.general.sound_feedback,
+            auto_enter: config.general.auto_enter,
+            app_rules: config.general.app_rules.clone(),
+            onboarded: config.general.onboarded,
             has_gemini_key: !config.model.gemini_api_key.is_empty(),
             has_qwen_key: !config.model.qwen_api_key.is_empty(),
             has_mimo_key: !config.model.mimo_api_key.is_empty(),
-            has_doubao_key: !config.model.doubao_api_key.is_empty(),
-            has_doubao_official_app_key: !config.model.doubao_official_app_key.is_empty(),
-            has_doubao_official_access_key: !config.model.doubao_official_access_key.is_empty(),
+            has_volc_keys: !config.model.volc_app_key.is_empty()
+                && !config.model.volc_access_key.is_empty(),
+            has_whisper_key: !config.model.whisper_api_key.is_empty(),
+            has_custom_llm_key: !config.model.custom_llm_api_key.is_empty(),
         }
     }
 }
@@ -645,657 +1167,6 @@ impl ConfigDto {
 struct SaveResult {
     restart_needed: bool,
 }
-
-#[derive(Clone, serde::Serialize)]
-struct DoubaoRealtimeSetupResult {
-    python: String,
-    credential_path: String,
-    base_url: String,
-    model_name: String,
-    installed: bool,
-    credential_ready: bool,
-    gateway_running: bool,
-    message: String,
-}
-
-#[derive(Clone)]
-struct PythonLauncher {
-    program: String,
-    prefix_args: Vec<String>,
-}
-
-#[tauri::command]
-async fn setup_doubao_realtime_runtime(
-    state: tauri::State<'_, AppState>,
-    credential_path: Option<String>,
-    base_url: Option<String>,
-    gateway_api_key: Option<String>,
-) -> Result<DoubaoRealtimeSetupResult, String> {
-    let (configured_path, configured_base_url, configured_api_key) = {
-        let cfg = state.config.read().await;
-        (
-            cfg.model.doubao_ime_credential_path.clone(),
-            cfg.model.doubao_base_url.clone(),
-            cfg.model.doubao_api_key.clone(),
-        )
-    };
-
-    let chosen_path = credential_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            let s = configured_path.trim();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s.to_string())
-            }
-        })
-        .unwrap_or_else(|| "~/.config/doubaoime-asr/credentials.json".to_string());
-
-    let base_url_candidate = base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            let s = configured_base_url.trim();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s.to_string())
-            }
-        })
-        .unwrap_or_else(|| DEFAULT_LOCAL_DOUBAO_BASE_URL.to_string());
-
-    let chosen_base_url = if parse_local_base_url(&base_url_candidate).is_some() {
-        base_url_candidate
-    } else {
-        tracing::warn!(
-            base_url = %base_url_candidate,
-            "One-click setup received non-local base_url, forcing local gateway endpoint"
-        );
-        DEFAULT_LOCAL_DOUBAO_BASE_URL.to_string()
-    };
-
-    let chosen_api_key = gateway_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            let s = configured_api_key.trim();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s.to_string())
-            }
-        })
-        .unwrap_or_default();
-
-    let launchers = python_launchers();
-    let pypi_install_args = [
-        "-m",
-        "pip",
-        "install",
-        "--disable-pip-version-check",
-        "--upgrade",
-        "doubaoime-asr",
-    ];
-    let github_install_args = [
-        "-m",
-        "pip",
-        "install",
-        "--disable-pip-version-check",
-        "--upgrade",
-        "git+https://github.com/starccy/doubaoime-asr.git",
-    ];
-
-    let (launcher, install_source) = {
-        let (primary_launcher, primary_output) =
-            run_python_command(&launchers, &pypi_install_args).await?;
-        if primary_output.status.success() {
-            (primary_launcher, "PyPI".to_string())
-        } else {
-            let primary_detail = command_output_detail(&primary_output);
-            tracing::warn!(
-                launcher = %format_python_launcher(&primary_launcher),
-                "PyPI install failed, trying GitHub fallback: {primary_detail}"
-            );
-
-            let (fallback_launcher, fallback_output) =
-                run_python_command(&launchers, &github_install_args).await?;
-            if fallback_output.status.success() {
-                (fallback_launcher, "GitHub".to_string())
-            } else {
-                let fallback_detail = command_output_detail(&fallback_output);
-                return Err(format!(
-                    "Failed to install doubaoime-asr.\nPyPI: {primary_detail}\nGitHub fallback: {fallback_detail}\nHint: doubaoime-asr requires Python >= 3.11, and GitHub install needs network access to github.com."
-                ));
-            }
-        }
-    };
-
-    let bootstrap_script = r#"import os
-from doubaoime_asr import ASRConfig
-p = os.environ.get("DOUBAO_IME_CREDENTIAL_PATH", "").strip()
-if not p:
-    raise RuntimeError("empty credential path")
-cfg = ASRConfig(credential_path=p)
-cfg.ensure_credentials()
-print(p)
-"#;
-
-    let setup_output = run_python_command_with_launcher(
-        &launcher,
-        &["-c", bootstrap_script],
-        &[("DOUBAO_IME_CREDENTIAL_PATH", chosen_path.clone())],
-    )
-    .await?;
-
-    if !setup_output.status.success() {
-        let stderr = String::from_utf8_lossy(&setup_output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&setup_output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(format!(
-            "Failed to initialize doubaoime-asr credential using {}: {}",
-            format_python_launcher(&launcher),
-            detail
-        ));
-    }
-
-    let expanded_path = expand_home_path(&chosen_path);
-    if !expanded_path.is_file() {
-        return Err(format!(
-            "Credential initialization completed, but file not found at {}",
-            expanded_path.display()
-        ));
-    }
-
-    let gateway_dep_args = [
-        "-m",
-        "pip",
-        "install",
-        "--disable-pip-version-check",
-        "--upgrade",
-        "fastapi",
-        "uvicorn[standard]",
-        "python-multipart",
-    ];
-    let gateway_dep_output =
-        run_python_command_with_launcher(&launcher, &gateway_dep_args, &[]).await?;
-    if !gateway_dep_output.status.success() {
-        return Err(format!(
-            "Failed to install gateway dependencies using {}: {}",
-            format_python_launcher(&launcher),
-            command_output_detail(&gateway_dep_output)
-        ));
-    }
-
-    let (new_recognizer, effective_model_name) = {
-        let mut cfg = state.config.write().await;
-        cfg.model.provider = notype_config::Provider::Doubao;
-        cfg.model.doubao_ime_credential_path = chosen_path.clone();
-        cfg.model.doubao_base_url = chosen_base_url.clone();
-        cfg.model.enable_doubao_realtime_ws = true;
-
-        let normalized_model = cfg.model.model_name.trim().to_lowercase();
-        if cfg.model.is_doubao_official_model() || !normalized_model.starts_with("doubao-asr") {
-            cfg.model.model_name = "doubao-asr".to_string();
-        }
-
-        if !chosen_api_key.trim().is_empty() {
-            cfg.model.doubao_api_key = chosen_api_key.clone();
-        }
-
-        notype_config::save(&cfg).map_err(|e| format!("Failed to persist runtime config: {e}"))?;
-        let effective_model_name = cfg.model.model_name.clone();
-        (build_recognizer(&cfg), effective_model_name)
-    };
-
-    {
-        let mut rec = state.recognizer.write().await;
-        *rec = new_recognizer;
-    }
-
-    ensure_local_doubao_gateway_running(
-        Arc::clone(&state.doubao_gateway_process),
-        chosen_base_url.clone(),
-        chosen_path.clone(),
-        chosen_api_key.clone(),
-    )
-    .await?;
-    let gateway_running = true;
-
-    Ok(DoubaoRealtimeSetupResult {
-        python: format_python_launcher(&launcher),
-        credential_path: expanded_path.to_string_lossy().to_string(),
-        base_url: chosen_base_url.clone(),
-        model_name: effective_model_name,
-        installed: true,
-        credential_ready: true,
-        gateway_running,
-        message: format!(
-            "doubaoime-asr installed ({install_source}), credentials initialized, runtime switched to Doubao local ASR, gateway running at {chosen_base_url}"
-        ),
-    })
-}
-
-fn python_launchers() -> Vec<PythonLauncher> {
-    if let Ok(value) = std::env::var("NOTYPE_DOUBAO_PYTHON") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return vec![PythonLauncher {
-                program: trimmed.to_string(),
-                prefix_args: Vec::new(),
-            }];
-        }
-    }
-
-    if cfg!(target_os = "windows") {
-        vec![
-            PythonLauncher {
-                program: "python".to_string(),
-                prefix_args: Vec::new(),
-            },
-            PythonLauncher {
-                program: "py".to_string(),
-                prefix_args: vec!["-3".to_string()],
-            },
-        ]
-    } else {
-        vec![
-            PythonLauncher {
-                program: "python3".to_string(),
-                prefix_args: Vec::new(),
-            },
-            PythonLauncher {
-                program: "python".to_string(),
-                prefix_args: Vec::new(),
-            },
-        ]
-    }
-}
-
-fn format_python_launcher(launcher: &PythonLauncher) -> String {
-    if launcher.prefix_args.is_empty() {
-        launcher.program.clone()
-    } else {
-        format!("{} {}", launcher.program, launcher.prefix_args.join(" "))
-    }
-}
-
-fn expand_home_path(path: &str) -> PathBuf {
-    if path == "~" {
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            return PathBuf::from(home);
-        }
-    }
-
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-
-    PathBuf::from(path)
-}
-
-fn command_output_detail(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        format!("process exited with status {}", output.status)
-    }
-}
-
-fn parse_local_base_url(base_url: &str) -> Option<(String, u16)> {
-    let normalized = base_url.trim().trim_end_matches('/');
-    let rest = normalized.strip_prefix("http://")?;
-    let authority = rest.split('/').next().unwrap_or_default();
-    if authority.is_empty() {
-        return None;
-    }
-
-    let (host_raw, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse::<u16>().ok()?),
-        None => (authority, 80),
-    };
-    let host = host_raw.trim_matches(|c| c == '[' || c == ']').to_string();
-    let is_local = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
-    if !is_local {
-        return None;
-    }
-    Some((host, port))
-}
-
-fn resolve_doubao_gateway_script_path() -> Option<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/doubao_asr_api_gateway.py"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/doubao_asr_api_gateway.py"),
-    ];
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("scripts/doubao_asr_api_gateway.py"));
-    }
-    candidates.into_iter().find(|p| p.is_file())
-}
-
-async fn check_local_gateway_health(host: &str, port: u16) -> bool {
-    let connect = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        tokio::net::TcpStream::connect((host, port)),
-    )
-    .await;
-
-    let Ok(Ok(mut stream)) = connect else {
-        return false;
-    };
-
-    let req = format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(req.as_bytes()).await.is_err() {
-        return false;
-    }
-
-    let mut buf = vec![0u8; 256];
-    match tokio::time::timeout(std::time::Duration::from_millis(800), stream.read(&mut buf)).await
-    {
-        Ok(Ok(n)) if n > 0 => {
-            let head = String::from_utf8_lossy(&buf[..n]);
-            head.contains("200")
-        }
-        _ => false,
-    }
-}
-
-fn should_manage_local_doubao_gateway(config: &notype_config::AppConfig) -> bool {
-    matches!(config.model.provider, notype_config::Provider::Doubao)
-        && !config.model.is_doubao_official_model()
-        && parse_local_base_url(&config.model.doubao_base_url).is_some()
-}
-
-async fn ensure_local_doubao_gateway_running(
-    gateway_slot: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
-    base_url: String,
-    credential_path: String,
-    api_key: String,
-) -> Result<(), String> {
-    let (host, port) = parse_local_base_url(&base_url)
-        .ok_or_else(|| "doubao_base_url is not a local http endpoint".to_string())?;
-
-    if check_local_gateway_health(&host, port).await {
-        return Ok(());
-    }
-
-    {
-        let mut slot = gateway_slot.lock().await;
-        let dead = if let Some(child) = slot.as_mut() {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    tracing::warn!("Existing doubao gateway exited: {status}");
-                    true
-                }
-                Ok(None) => false,
-                Err(e) => {
-                    tracing::warn!("Failed to inspect doubao gateway process: {e}");
-                    true
-                }
-            }
-        } else {
-            false
-        };
-        if dead {
-            *slot = None;
-        }
-    }
-
-    if check_local_gateway_health(&host, port).await {
-        return Ok(());
-    }
-
-    let script = resolve_doubao_gateway_script_path()
-        .ok_or_else(|| "doubao gateway script not found".to_string())?;
-    let python = std::env::var("NOTYPE_DOUBAO_PYTHON").unwrap_or_else(|_| "python3".to_string());
-
-    let mut cmd = tokio::process::Command::new(&python);
-    cmd.arg("-u")
-        .arg(script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("DOUBAO_ASR_HOST", host.clone())
-        .env("DOUBAO_ASR_PORT", port.to_string())
-        .env("DOUBAO_ASR_CREDENTIAL_PATH", credential_path);
-    if !api_key.trim().is_empty() {
-        cmd.env("DOUBAO_ASR_API_KEY", api_key);
-    }
-    apply_doubao_network_env(&mut cmd);
-    apply_opus_runtime_env(&mut cmd);
-
-    let mut child = cmd.spawn().map_err(|e| {
-        format!("Failed to start local doubao-asr2api gateway via {python}: {e}")
-    })?;
-
-    if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) if !line.trim().is_empty() => {
-                        tracing::info!("doubao-gateway: {line}");
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::debug!("doubao-gateway stdout read error: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) if !line.trim().is_empty() => {
-                        tracing::warn!("doubao-gateway stderr: {line}");
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::debug!("doubao-gateway stderr read error: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    {
-        let mut slot = gateway_slot.lock().await;
-        if let Some(mut old) = slot.take() {
-            let _ = old.kill().await;
-        }
-        *slot = Some(child);
-    }
-
-    for _ in 0..24 {
-        if check_local_gateway_health(&host, port).await {
-            tracing::info!(host = %host, port, "Local doubao-asr2api gateway ready");
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-
-    {
-        let mut slot = gateway_slot.lock().await;
-        if let Some(mut child) = slot.take() {
-            let _ = child.kill().await;
-        }
-    }
-
-    Err("Local doubao-asr2api gateway failed health check on startup".to_string())
-}
-
-async fn run_doubao_gateway_maintainer(
-    config: Arc<tokio::sync::RwLock<notype_config::AppConfig>>,
-    gateway_slot: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
-) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        interval.tick().await;
-        let cfg = config.read().await.clone();
-        if !should_manage_local_doubao_gateway(&cfg) {
-            continue;
-        }
-        if let Err(e) = ensure_local_doubao_gateway_running(
-            Arc::clone(&gateway_slot),
-            cfg.model.doubao_base_url.clone(),
-            cfg.model.doubao_ime_credential_path.clone(),
-            cfg.model.doubao_api_key.clone(),
-        )
-        .await
-        {
-            tracing::warn!("Failed to keep local doubao-asr2api gateway alive: {e}");
-        }
-    }
-}
-
-async fn run_python_command(
-    launchers: &[PythonLauncher],
-    args: &[&str],
-) -> Result<(PythonLauncher, std::process::Output), String> {
-    let mut attempted = Vec::new();
-
-    for launcher in launchers {
-        attempted.push(format_python_launcher(launcher));
-        let mut cmd = tokio::process::Command::new(&launcher.program);
-        cmd.args(&launcher.prefix_args)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        apply_doubao_network_env(&mut cmd);
-        apply_opus_runtime_env(&mut cmd);
-
-        match cmd.output().await {
-            Ok(output) => return Ok((launcher.clone(), output)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(format!(
-                    "Failed to start {}: {e}",
-                    format_python_launcher(launcher)
-                ));
-            }
-        }
-    }
-
-    Err(format!(
-        "No usable Python found (tried: {}). Set NOTYPE_DOUBAO_PYTHON to specify one.",
-        attempted.join(", ")
-    ))
-}
-
-async fn run_python_command_with_launcher(
-    launcher: &PythonLauncher,
-    args: &[&str],
-    envs: &[(&str, String)],
-) -> Result<std::process::Output, String> {
-    let mut cmd = tokio::process::Command::new(&launcher.program);
-    cmd.args(&launcher.prefix_args)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_doubao_network_env(&mut cmd);
-    apply_opus_runtime_env(&mut cmd);
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
-
-    cmd.output().await.map_err(|e| {
-        format!(
-            "Failed to run {}: {e}",
-            format_python_launcher(launcher)
-        )
-    })
-}
-
-fn apply_opus_runtime_env(cmd: &mut tokio::process::Command) {
-    #[cfg(target_os = "macos")]
-    {
-        let mut dirs = Vec::new();
-        for dir in ["/opt/homebrew/lib", "/usr/local/lib", "/opt/local/lib"] {
-            if std::path::Path::new(dir).is_dir() {
-                dirs.push(dir.to_string());
-            }
-        }
-        if !dirs.is_empty() {
-            let prefixes = dirs.join(":");
-            let fallback = std::env::var("DYLD_FALLBACK_LIBRARY_PATH").unwrap_or_default();
-            let fallback_value = if fallback.is_empty() {
-                prefixes.clone()
-            } else {
-                format!("{prefixes}:{fallback}")
-            };
-            let dyld = std::env::var("DYLD_LIBRARY_PATH").unwrap_or_default();
-            let dyld_value = if dyld.is_empty() {
-                prefixes
-            } else {
-                format!("{fallback_value}:{dyld}")
-            };
-            cmd.env("DYLD_FALLBACK_LIBRARY_PATH", fallback_value);
-            cmd.env("DYLD_LIBRARY_PATH", dyld_value);
-        }
-    }
-}
-
-fn apply_doubao_network_env(cmd: &mut tokio::process::Command) {
-    let required_hosts = [
-        "log.snssdk.com",
-        "is.snssdk.com",
-        "frontier-audio-ime-ws.doubao.com",
-        "ime.oceancloudapi.com",
-        "keyhub.zijieapi.com",
-        "speech.bytedance.com",
-        ".snssdk.com",
-        ".doubao.com",
-        ".oceancloudapi.com",
-        ".zijieapi.com",
-        ".bytedance.com",
-    ];
-
-    let mut merged = std::env::var("NO_PROXY")
-        .or_else(|_| std::env::var("no_proxy"))
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<String>>();
-
-    for host in required_hosts {
-        if !merged.iter().any(|v| v.eq_ignore_ascii_case(host)) {
-            merged.push(host.to_string());
-        }
-    }
-
-    let value = merged.join(",");
-    cmd.env("NO_PROXY", &value);
-    cmd.env("no_proxy", value);
-}
-
-// -- App Lifecycle --
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1330,9 +1201,8 @@ pub fn run() {
         has_gemini_key = !config.model.gemini_api_key.is_empty(),
         has_qwen_key = !config.model.qwen_api_key.is_empty(),
         has_mimo_key = !config.model.mimo_api_key.is_empty(),
-        has_doubao_key = !config.model.doubao_api_key.is_empty(),
-        has_doubao_official_app_key = !config.model.doubao_official_app_key.is_empty(),
-        has_doubao_official_access_key = !config.model.doubao_official_access_key.is_empty(),
+        has_volc_keys = !config.model.volc_app_key.is_empty(),
+        has_whisper_key = !config.model.whisper_api_key.is_empty(),
         "Config loaded"
     );
 
@@ -1356,8 +1226,13 @@ pub fn run() {
             bubble_generation: Arc::new(AtomicU64::new(0)),
             hotkey_down: Arc::new(AtomicBool::new(false)),
             ui_capture: Arc::new(AtomicBool::new(false)),
+            edit_session: Arc::new(AtomicBool::new(false)),
+            hotkey_pressed_at: Arc::new(std::sync::Mutex::new(None)),
+            capture_latched: Arc::new(AtomicBool::new(false)),
+            swallow_release: Arc::new(AtomicBool::new(false)),
+            active_app: Arc::new(std::sync::Mutex::new(None)),
             latest_interim_text: Arc::new(std::sync::Mutex::new(String::new())),
-            doubao_gateway_process: Arc::new(tokio::sync::Mutex::new(None)),
+            stream_final_gen: Arc::new(AtomicU64::new(0)),
         })
         .on_window_event(|window, event| {
             // Only intercept close on main window (hide to tray)
@@ -1386,15 +1261,6 @@ pub fn run() {
                 }
             }
 
-            // Keep local doubao-asr2api gateway alive for doubao-asr mode.
-            let state = app.state::<AppState>();
-            let cfg = Arc::clone(&state.config);
-            let gateway = Arc::clone(&state.doubao_gateway_process);
-            let rt = state.runtime.clone();
-            rt.spawn(async move {
-                run_doubao_gateway_maintainer(cfg, gateway).await;
-            });
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1410,12 +1276,20 @@ pub fn run() {
             save_config,
             get_history,
             delete_history_entry,
+            update_history_entry,
+            learn_vocabulary,
             clear_history,
             copy_text_to_clipboard,
+            get_stats,
+            set_output_style,
+            quick_setup,
+            mark_onboarded,
+            export_history,
+            check_permissions,
+            open_accessibility_settings,
             get_autostart,
             set_autostart,
             open_config_dir,
-            setup_doubao_realtime_runtime,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1428,25 +1302,44 @@ fn setup_global_shortcut(app: &tauri::App) -> std::result::Result<(), Box<dyn st
     use tauri::Manager;
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
-    // Read hotkey from config
-    let hotkey_str = {
+    // Read hotkeys from config
+    let (hotkey_str, edit_hotkey_str) = {
         let state = app.state::<AppState>();
         let rt = state.runtime.clone();
         let cfg = Arc::clone(&state.config);
-        rt.block_on(async { cfg.read().await.general.hotkey.clone() })
+        rt.block_on(async {
+            let c = cfg.read().await;
+            (c.general.hotkey.clone(), c.general.edit_hotkey.clone())
+        })
     };
 
     let shortcut =
         parse_hotkey(&hotkey_str).map_err(|e| format!("Invalid hotkey '{hotkey_str}': {e}"))?;
+    let edit_shortcut = resolve_edit_shortcut(&edit_hotkey_str, &shortcut);
+    let edit_id = edit_shortcut.as_ref().map(|s| s.id());
 
     app.handle().plugin(
         tauri_plugin_global_shortcut::Builder::new()
-            .with_handler(move |app, _sc, event| {
+            .with_handler(move |app, sc, event| {
                 let state = app.state::<AppState>();
                 let hotkey_down = &state.hotkey_down;
+                let is_edit = edit_id == Some(sc.id());
 
                 match event.state() {
                     ShortcutState::Pressed => {
+                        // A latched (tap-locked) session stops on the next press.
+                        if state.capture_latched.load(Ordering::SeqCst)
+                            && state.recorder.is_recording()
+                        {
+                            state.capture_latched.store(false, Ordering::SeqCst);
+                            state.swallow_release.store(true, Ordering::SeqCst);
+                            if let Err(e) = stop_capture(app) {
+                                tracing::error!("Failed to stop latched recording: {e}");
+                                emit_status(app, "Error", Some(&e));
+                            }
+                            return;
+                        }
+
                         if hotkey_down
                             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                             .is_err()
@@ -1461,18 +1354,37 @@ fn setup_global_shortcut(app: &tauri::App) -> std::result::Result<(), Box<dyn st
                             return;
                         }
 
-                        if let Err(e) = start_capture(app, false) {
+                        if let Err(e) = start_capture(app, false, is_edit) {
                             hotkey_down.store(false, Ordering::SeqCst);
                             tracing::error!("Failed to start recording: {e}");
                             emit_status(app, "Error", Some(&e));
+                        } else if let Ok(mut guard) = state.hotkey_pressed_at.lock() {
+                            *guard = Some(Instant::now());
                         }
                     }
                     ShortcutState::Released => {
+                        if state.swallow_release.swap(false, Ordering::SeqCst) {
+                            hotkey_down.store(false, Ordering::SeqCst);
+                            return;
+                        }
                         if !hotkey_down.swap(false, Ordering::SeqCst) {
                             return;
                         }
 
                         if state.recorder.is_recording() {
+                            // Quick tap → latch: keep recording hands-free
+                            // until the hotkey is pressed again.
+                            let quick_tap = state
+                                .hotkey_pressed_at
+                                .lock()
+                                .ok()
+                                .and_then(|g| *g)
+                                .is_some_and(|t| t.elapsed().as_millis() < 450);
+                            if quick_tap {
+                                state.capture_latched.store(true, Ordering::SeqCst);
+                                tracing::info!("Recording latched by quick tap");
+                                return;
+                            }
                             if let Err(e) = stop_capture(app) {
                                 tracing::error!("Failed to stop recording: {e}");
                                 emit_status(app, "Error", Some(&e));
@@ -1485,8 +1397,39 @@ fn setup_global_shortcut(app: &tauri::App) -> std::result::Result<(), Box<dyn st
     )?;
 
     app.global_shortcut().register(shortcut)?;
-    tracing::info!("Global shortcut Ctrl+. registered");
+    if let Some(edit_sc) = edit_shortcut {
+        if let Err(e) = app.global_shortcut().register(edit_sc) {
+            tracing::warn!("Failed to register voice-edit hotkey '{edit_hotkey_str}': {e}");
+        } else {
+            tracing::info!(hotkey = %edit_hotkey_str, "Voice-edit shortcut registered");
+        }
+    }
+    tracing::info!(hotkey = %hotkey_str, "Global shortcut registered");
     Ok(())
+}
+
+/// Parse the voice-edit hotkey; disabled when empty, invalid, or identical
+/// to the dictation hotkey.
+#[cfg(desktop)]
+fn resolve_edit_shortcut(
+    edit_hotkey: &str,
+    main: &tauri_plugin_global_shortcut::Shortcut,
+) -> Option<tauri_plugin_global_shortcut::Shortcut> {
+    let trimmed = edit_hotkey.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match parse_hotkey(trimmed) {
+        Ok(sc) if sc.id() == main.id() => {
+            tracing::warn!("Voice-edit hotkey equals dictation hotkey; edit disabled");
+            None
+        }
+        Ok(sc) => Some(sc),
+        Err(e) => {
+            tracing::warn!("Invalid voice-edit hotkey '{trimmed}': {e}");
+            None
+        }
+    }
 }
 
 #[cfg(not(desktop))]
@@ -1498,13 +1441,11 @@ fn setup_global_shortcut(_app: &tauri::App) -> std::result::Result<(), Box<dyn s
 
 const INTERIM_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(2000);
 const INTERIM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2500);
-const INTERIM_INITIAL_DELAY_DOUBAO: std::time::Duration = std::time::Duration::from_millis(300);
-const INTERIM_INTERVAL_DOUBAO: std::time::Duration = std::time::Duration::from_millis(900);
+/// Dedicated ASR engines are fast + cheap; poll them more eagerly.
+const INTERIM_INITIAL_DELAY_ASR: std::time::Duration = std::time::Duration::from_millis(900);
+const INTERIM_INTERVAL_ASR: std::time::Duration = std::time::Duration::from_millis(1300);
 const INTERIM_MIN_DURATION: f32 = 1.0;
-const INTERIM_DOUBAO_MIN_CHUNK_DURATION: f32 = 0.75;
-const INTERIM_DOUBAO_CONTEXT_SECS: f32 = 1.2;
-const INTERIM_DOUBAO_QUOTA_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
-const INTERIM_DOUBAO_WS_PCM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
+const VOLC_PCM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
 async fn interim_loop(
     app: tauri::AppHandle,
@@ -1515,19 +1456,14 @@ async fn interim_loop(
     generation: Arc<AtomicU64>,
     gen_val: u64,
 ) {
-    let provider = { config.read().await.model.provider.clone() };
+    let (provider, is_asr) = {
+        let cfg = config.read().await;
+        (cfg.model.provider.clone(), cfg.model.is_asr_pipeline())
+    };
 
-    if matches!(provider, notype_config::Provider::Doubao) {
-        interim_loop_doubao_streaming(
-            app,
-            recorder,
-            recognizer,
-            config,
-            latest_interim_text,
-            generation,
-            gen_val,
-        )
-        .await;
+    if matches!(provider, notype_config::Provider::Volcengine) {
+        interim_loop_volcengine(app, recorder, config, latest_interim_text, generation, gen_val)
+            .await;
     } else {
         interim_loop_default(
             app,
@@ -1537,11 +1473,13 @@ async fn interim_loop(
             latest_interim_text,
             generation,
             gen_val,
+            is_asr,
         )
         .await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn interim_loop_default(
     app: tauri::AppHandle,
     recorder: Arc<Recorder>,
@@ -1550,11 +1488,20 @@ async fn interim_loop_default(
     latest_interim_text: Arc<std::sync::Mutex<String>>,
     generation: Arc<AtomicU64>,
     gen_val: u64,
+    is_asr: bool,
 ) {
-    let prompt = { config.read().await.prompts.compose() };
+    let prompt = {
+        let cfg = config.read().await;
+        compose_session_prompt(&app, &cfg)
+    };
+    let (initial_delay, interval) = if is_asr {
+        (INTERIM_INITIAL_DELAY_ASR, INTERIM_INTERVAL_ASR)
+    } else {
+        (INTERIM_INITIAL_DELAY, INTERIM_INTERVAL)
+    };
     let mut last_asr_text = String::new();
 
-    tokio::time::sleep(INTERIM_INITIAL_DELAY).await;
+    tokio::time::sleep(initial_delay).await;
 
     loop {
         if generation.load(Ordering::SeqCst) != gen_val || !recorder.is_recording() {
@@ -1567,7 +1514,7 @@ async fn interim_loop_default(
         };
 
         if audio.duration_secs < INTERIM_MIN_DURATION {
-            tokio::time::sleep(INTERIM_INTERVAL).await;
+            tokio::time::sleep(interval).await;
             continue;
         }
 
@@ -1604,694 +1551,130 @@ async fn interim_loop_default(
             _ => {}
         }
 
-        tokio::time::sleep(INTERIM_INTERVAL).await;
+        tokio::time::sleep(interval).await;
     }
 }
 
-async fn interim_loop_doubao_streaming(
+/// Volcengine live pipeline: stream mic PCM over one WebSocket session while
+/// recording; incremental full-text updates drive the preview. When the
+/// recorder stops we flush the session and publish the final text for
+/// `process_audio` to pick up.
+async fn interim_loop_volcengine(
     app: tauri::AppHandle,
     recorder: Arc<Recorder>,
-    recognizer: Arc<tokio::sync::RwLock<Option<Box<dyn VoiceRecognizer>>>>,
     config: Arc<tokio::sync::RwLock<notype_config::AppConfig>>,
     latest_interim_text: Arc<std::sync::Mutex<String>>,
     generation: Arc<AtomicU64>,
     gen_val: u64,
 ) {
-    let cfg_snapshot = { config.read().await.clone() };
-    let prompt = cfg_snapshot.prompts.compose();
-    let postprocess_spec = build_postprocess_spec(&cfg_snapshot);
-
-    if should_use_doubao_ws_realtime(&cfg_snapshot) {
-        let used_ws = interim_loop_doubao_ws_realtime(
-            app.clone(),
-            Arc::clone(&recorder),
-            Arc::clone(&latest_interim_text),
-            Arc::clone(&generation),
-            gen_val,
-            cfg_snapshot.model.doubao_ime_credential_path.clone(),
-            postprocess_spec.clone(),
-        )
-        .await;
-        if used_ws {
-            return;
+    let volc_config = {
+        let cfg = config.read().await;
+        notype_llm::volcengine::VolcConfig {
+            app_key: cfg.model.volc_app_key.clone(),
+            access_key: cfg.model.volc_access_key.clone(),
+            resource_id: cfg.model.volc_resource_id.clone(),
         }
-        tracing::warn!("Doubao realtime WS unavailable, fallback to chunked interim mode");
+    };
+    if volc_config.app_key.trim().is_empty() || volc_config.access_key.trim().is_empty() {
+        return;
     }
 
-    tokio::time::sleep(INTERIM_INITIAL_DELAY_DOUBAO).await;
+    let (text_tx, mut text_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let session =
+        match notype_llm::volcengine::VolcStreamSession::start(volc_config, text_tx).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Volcengine live session failed to start: {e}");
+                return;
+            }
+        };
 
     let mut last_end_sample = 0usize;
-    let mut sample_rate = 16_000u32;
-    let mut channels = 1u16;
-    let mut rough_text = String::new();
-    let mut displayed_text = String::new();
-    let mut completed_source_sentences: Vec<String> = Vec::new();
-    let mut corrected_display_sentences: Vec<String> = Vec::new();
-    let mut last_llm_index: Option<usize> = None;
-    let mut last_llm_target = String::new();
-    let mut quota_cooldown_until: Option<Instant> = None;
-    let stable_revision = Arc::new(AtomicU64::new(0));
-    let mut llm_task: Option<tokio::task::JoinHandle<(usize, String, Option<String>)>> = None;
-    let mut interval = tokio::time::interval(INTERIM_INTERVAL_DOUBAO);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let is_valid_session =
-        || generation.load(Ordering::SeqCst) == gen_val && recorder.is_recording();
-
-    loop {
-        interval.tick().await;
-
-        if !is_valid_session() {
-            break;
-        }
-
-        if let Some(until) = quota_cooldown_until {
-            if Instant::now() < until {
-                continue;
-            }
-            quota_cooldown_until = None;
-        }
-
-        if llm_task.as_ref().is_some_and(|h| h.is_finished()) {
-            if let Some(task) = llm_task.take() {
-                last_llm_index = None;
-                last_llm_target.clear();
-                match task.await {
-                    Ok((target_index, target_sentence, Some(processed_sentence)))
-                        if !processed_sentence.trim().is_empty() && is_valid_session() =>
-                    {
-                        if completed_source_sentences
-                            .get(target_index)
-                            .is_some_and(|current| same_live_sentence(current, &target_sentence))
-                        {
-                            if corrected_display_sentences.len() > target_index {
-                                corrected_display_sentences[target_index] =
-                                    compact_repeated_sentences(&processed_sentence);
-                                corrected_display_sentences.truncate(target_index + 1);
-                            } else {
-                                while corrected_display_sentences.len() < target_index {
-                                    corrected_display_sentences.push(String::new());
-                                }
-                                corrected_display_sentences
-                                    .push(compact_repeated_sentences(&processed_sentence));
-                            }
-                            maybe_emit_live_display(
-                                &app,
-                                &latest_interim_text,
-                                &mut displayed_text,
-                                &rough_text,
-                                &corrected_display_sentences,
-                                is_valid_session(),
-                            );
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) if e.is_cancelled() => {}
-                    Err(e) => tracing::warn!("Doubao live post-process task failed: {e}"),
-                }
-            }
-        }
-
-        let context_samples =
-            ((sample_rate as f32 * channels as f32 * INTERIM_DOUBAO_CONTEXT_SECS) as usize)
-                .max(1);
-        let from_sample = last_end_sample.saturating_sub(context_samples);
-
-        let snapshot = recorder.snapshot_from(from_sample);
-        let Some(snapshot_result) = snapshot else {
-            break;
-        };
-        let slice = match snapshot_result {
-            Ok(slice) => slice,
-            Err(e) => {
-                tracing::warn!("Doubao interim snapshot failed: {e}");
-                tokio::time::sleep(INTERIM_INTERVAL_DOUBAO).await;
-                continue;
-            }
-        };
-
-        sample_rate = slice.audio.sample_rate.max(1);
-        channels = slice.audio.channels.max(1);
-
-        let new_samples = slice.end_sample.saturating_sub(last_end_sample);
-        if new_samples == 0 {
-            maybe_schedule_live_postprocess(
-                &mut llm_task,
-                &postprocess_spec,
-                &completed_source_sentences,
-                &corrected_display_sentences,
-                &mut last_llm_index,
-                &mut last_llm_target,
-                &app,
-                &recorder,
-                &generation,
-                gen_val,
-                &stable_revision,
-            );
-            continue;
-        }
-
-        let new_duration = new_samples as f32 / (sample_rate as f32 * channels as f32);
-        last_end_sample = slice.end_sample;
-
-        if new_duration < INTERIM_DOUBAO_MIN_CHUNK_DURATION {
-            continue;
-        }
-
-        let guard = recognizer.read().await;
-        let Some(rec) = guard.as_ref() else {
-            break;
-        };
-
-        tracing::info!(
-            chunk_secs = new_duration,
-            start_sample = slice.start_sample,
-            end_sample = slice.end_sample,
-            "Doubao incremental interim transcription request"
-        );
-
-        let _serial_guard = doubao_asr_serial_mutex().lock().await;
-        let result = rec
-            .recognize(slice.audio.wav_bytes, "audio/wav".into(), prompt.clone())
-            .await;
-        drop(_serial_guard);
-
-        drop(guard);
-
-        match result {
-            Ok(result) if !result.text.trim().is_empty() => {
-                let merged = merge_incremental_asr_text(&rough_text, &result.text);
-                if merged != rough_text {
-                    let compacted = compact_repeated_sentences(&merged);
-                    if compacted.len() < merged.len() {
-                        tracing::info!(
-                            before_chars = merged.chars().count(),
-                            after_chars = compacted.chars().count(),
-                            "Compacted repeated fragments in chunked Doubao rough text"
-                        );
-                    }
-                    rough_text = compacted;
-                    let (next_completed_source_sentences, _) =
-                        split_live_completed_sentences(&rough_text);
-                    let shared_prefix = common_live_sentence_prefix_len(
-                        &completed_source_sentences,
-                        &next_completed_source_sentences,
-                    );
-                    if shared_prefix < completed_source_sentences.len() {
-                        stable_revision.fetch_add(1, Ordering::SeqCst);
-                        completed_source_sentences
-                            .truncate(shared_prefix);
-                        corrected_display_sentences
-                            .truncate(shared_prefix);
-                        last_llm_index = None;
-                        last_llm_target.clear();
-                        if let Some(task) = llm_task.take() {
-                            task.abort();
-                        }
-                    }
-                    if next_completed_source_sentences.len() < corrected_display_sentences.len() {
-                        corrected_display_sentences
-                            .truncate(next_completed_source_sentences.len());
-                    }
-                    completed_source_sentences = next_completed_source_sentences;
-                    maybe_emit_live_display(
-                        &app,
-                        &latest_interim_text,
-                        &mut displayed_text,
-                        &rough_text,
-                        &corrected_display_sentences,
-                        is_valid_session(),
-                    );
-                }
-            }
-            Err(e) => {
-                let error_msg = e.to_string();
-                if is_doubao_concurrency_quota_error(&error_msg) {
-                    quota_cooldown_until = Some(Instant::now() + INTERIM_DOUBAO_QUOTA_COOLDOWN);
-                    tracing::warn!(
-                        cooldown_ms = INTERIM_DOUBAO_QUOTA_COOLDOWN.as_millis(),
-                        "Doubao interim throttled by ExceededConcurrentQuota, entering cooldown"
-                    );
-                } else {
-                    tracing::debug!("Doubao incremental interim transcription failed: {error_msg}");
-                }
-            }
-            _ => {}
-        }
-
-        maybe_schedule_live_postprocess(
-            &mut llm_task,
-            &postprocess_spec,
-            &completed_source_sentences,
-            &corrected_display_sentences,
-            &mut last_llm_index,
-            &mut last_llm_target,
-            &app,
-            &recorder,
-            &generation,
-            gen_val,
-            &stable_revision,
-        );
-    }
-
-    if let Some(task) = llm_task.take() {
-        task.abort();
-    }
-}
-
-fn should_use_doubao_ws_realtime(config: &notype_config::AppConfig) -> bool {
-    matches!(config.model.provider, notype_config::Provider::Doubao)
-        && config.model.enable_doubao_realtime_ws
-        && !config.model.is_doubao_official_model()
-        && !DOUBAO_WS_DISABLED.load(Ordering::SeqCst)
-}
-
-fn resolve_doubao_bridge_script_path() -> Option<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/doubao_realtime_bridge.py"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/doubao_realtime_bridge.py"),
-    ];
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("scripts/doubao_realtime_bridge.py"));
-    }
-    candidates.into_iter().find(|p| p.is_file())
-}
-
-async fn send_doubao_bridge_message(
-    stdin: &mut tokio::process::ChildStdin,
-    msg: &DoubaoBridgeInMessage<'_>,
-) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(msg).map_err(std::io::Error::other)?;
-    line.push(b'\n');
-    stdin.write_all(&line).await?;
-    stdin.flush().await
-}
-
-async fn interim_loop_doubao_ws_realtime(
-    app: tauri::AppHandle,
-    recorder: Arc<Recorder>,
-    latest_interim_text: Arc<std::sync::Mutex<String>>,
-    generation: Arc<AtomicU64>,
-    gen_val: u64,
-    credential_path: String,
-    postprocess_spec: Option<PostprocessSpec>,
-) -> bool {
-    let Some(bridge_script) = resolve_doubao_bridge_script_path() else {
-        tracing::warn!("Doubao realtime bridge script not found");
-        return false;
-    };
-
-    let python = std::env::var("NOTYPE_DOUBAO_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let mut cmd = tokio::process::Command::new(&python);
-    cmd.arg("-u")
-        .arg(&bridge_script)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_doubao_network_env(&mut cmd);
-    apply_opus_runtime_env(&mut cmd);
-
-    if !credential_path.trim().is_empty() {
-        cmd.env("DOUBAO_IME_CREDENTIAL_PATH", credential_path);
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("Failed to start Doubao realtime bridge ({python}): {e}");
-            return false;
-        }
-    };
-
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) if !line.trim().is_empty() => {
-                        tracing::debug!("doubao-bridge stderr: {line}");
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::debug!("doubao-bridge stderr read error: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    let mut stdin = match child.stdin.take() {
-        Some(v) => v,
-        None => {
-            let _ = child.kill().await;
-            return false;
-        }
-    };
-    let stdout = match child.stdout.take() {
-        Some(v) => v,
-        None => {
-            let _ = child.kill().await;
-            return false;
-        }
-    };
-    let mut lines = BufReader::new(stdout).lines();
-
-    let ready_line = tokio::time::timeout(std::time::Duration::from_secs(3), lines.next_line())
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten();
-    let Some(ready_line) = ready_line else {
-        let _ = child.kill().await;
-        tracing::warn!("Doubao realtime bridge did not become ready");
-        return false;
-    };
-
-    let ready_msg = serde_json::from_str::<DoubaoBridgeOutMessage>(&ready_line).ok();
-    if !ready_msg.as_ref().is_some_and(|m| m.kind == "ready") {
-        if let Some(m) = ready_msg {
-            let message = m.message.unwrap_or_else(|| "unknown".to_string());
-            tracing::warn!(
-                "Doubao realtime bridge startup error: {}",
-                message
-            );
-            if is_doubao_concurrency_quota_error(&message) {
-                tracing::warn!(
-                    "Doubao realtime WS quota exceeded on startup; disable WS and fallback to chunked interim mode"
-                );
-                disable_doubao_ws_for_session();
-                let _ = child.kill().await;
-                return false;
-            }
-        } else {
-            tracing::warn!("Doubao realtime bridge invalid ready payload: {ready_line}");
-        }
-        let _ = child.kill().await;
-        return false;
-    }
-
-    DOUBAO_WS_ACTIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
-    let _ws_guard = DoubaoWsSessionGuard;
-
-    let is_valid_session =
-        || generation.load(Ordering::SeqCst) == gen_val && recorder.is_recording();
-
-    let mut last_end_sample = 0usize;
-    let mut rough_text = String::new();
-    let mut displayed_text = String::new();
-    let mut completed_source_sentences: Vec<String> = Vec::new();
-    let mut corrected_display_sentences: Vec<String> = Vec::new();
-    let mut last_llm_index: Option<usize> = None;
-    let mut last_llm_target = String::new();
-    let mut bridge_failed = false;
-    let mut logged_resample = false;
-    let stable_revision = Arc::new(AtomicU64::new(0));
-    let mut llm_task: Option<tokio::task::JoinHandle<(usize, String, Option<String>)>> = None;
-    let mut pcm_interval = tokio::time::interval(INTERIM_DOUBAO_WS_PCM_INTERVAL);
+    let mut pcm_interval = tokio::time::interval(VOLC_PCM_INTERVAL);
     pcm_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let is_valid = || generation.load(Ordering::SeqCst) == gen_val;
+
     loop {
-        if !is_valid_session() {
+        if !is_valid() {
+            // Session cancelled — drop everything.
+            return;
+        }
+        if !recorder.is_recording() {
             break;
         }
-
-        if llm_task.as_ref().is_some_and(|h| h.is_finished()) {
-            if let Some(task) = llm_task.take() {
-                last_llm_index = None;
-                last_llm_target.clear();
-                match task.await {
-                    Ok((target_index, target_sentence, Some(processed_sentence)))
-                        if !processed_sentence.trim().is_empty() && is_valid_session() =>
-                    {
-                        if completed_source_sentences
-                            .get(target_index)
-                            .is_some_and(|current| same_live_sentence(current, &target_sentence))
-                        {
-                            if corrected_display_sentences.len() > target_index {
-                                corrected_display_sentences[target_index] =
-                                    compact_repeated_sentences(&processed_sentence);
-                                corrected_display_sentences.truncate(target_index + 1);
-                            } else {
-                                while corrected_display_sentences.len() < target_index {
-                                    corrected_display_sentences.push(String::new());
-                                }
-                                corrected_display_sentences
-                                    .push(compact_repeated_sentences(&processed_sentence));
-                            }
-                            maybe_emit_live_display(
-                                &app,
-                                &latest_interim_text,
-                                &mut displayed_text,
-                                &rough_text,
-                                &corrected_display_sentences,
-                                is_valid_session(),
-                            );
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) if e.is_cancelled() => {}
-                    Err(e) => tracing::warn!("Doubao ws post-process task failed: {e}"),
-                }
-            }
-        }
-
-        maybe_schedule_live_postprocess(
-            &mut llm_task,
-            &postprocess_spec,
-            &completed_source_sentences,
-            &corrected_display_sentences,
-            &mut last_llm_index,
-            &mut last_llm_target,
-            &app,
-            &recorder,
-            &generation,
-            gen_val,
-            &stable_revision,
-        );
 
         tokio::select! {
             _ = pcm_interval.tick() => {
-                let snapshot = recorder.snapshot_pcm_from(last_end_sample);
-                let Some(snapshot_result) = snapshot else {
+                let Some(snapshot) = recorder.snapshot_pcm_from(last_end_sample) else {
                     break;
                 };
-                let pcm = match snapshot_result {
-                    Ok(pcm) => pcm,
-                    Err(e) => {
-                        tracing::debug!("Doubao ws pcm snapshot failed: {e}");
-                        continue;
-                    }
+                let Ok(pcm) = snapshot else {
+                    continue;
                 };
-
                 if pcm.end_sample <= last_end_sample || pcm.pcm_s16le.is_empty() {
                     continue;
                 }
                 last_end_sample = pcm.end_sample;
-
-                if !logged_resample && (pcm.sample_rate != 16000 || pcm.channels != 1) {
-                    tracing::info!(
-                        sample_rate = pcm.sample_rate,
-                        channels = pcm.channels,
-                        "Resampling realtime PCM to 16kHz mono for doubao ws bridge"
-                    );
-                    logged_resample = true;
-                }
-
-                let bridge_pcm = convert_pcm_chunk_to_16k_mono_s16le(
+                let chunk = convert_pcm_chunk_to_16k_mono_s16le(
                     &pcm.pcm_s16le,
                     pcm.sample_rate,
                     pcm.channels,
                 );
-                if bridge_pcm.is_empty() {
-                    continue;
-                }
-
-                let msg = DoubaoBridgeInMessage {
-                    kind: "audio",
-                    pcm_b64: Some(base64::engine::general_purpose::STANDARD.encode(&bridge_pcm)),
-                };
-                if let Err(e) = send_doubao_bridge_message(&mut stdin, &msg).await {
-                    tracing::warn!("Failed to send pcm to doubao bridge: {e}");
-                    bridge_failed = true;
+                if !chunk.is_empty() && !session.push_pcm(chunk) {
+                    tracing::warn!("Volcengine session closed while pushing PCM");
                     break;
                 }
             }
-            line_result = lines.next_line() => {
-                let line = match line_result {
-                    Ok(Some(line)) => line,
-                    Ok(None) => {
-                        bridge_failed = true;
-                        break;
+            update = text_rx.recv() => {
+                match update {
+                    Some(text) if is_valid() => {
+                        set_interim_with_cache(&app, &latest_interim_text, &text);
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed reading doubao bridge output: {e}");
-                        bridge_failed = true;
-                        break;
-                    }
-                };
-
-                let msg = match serde_json::from_str::<DoubaoBridgeOutMessage>(&line) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        tracing::debug!("Ignore invalid doubao bridge payload: {e}");
-                        continue;
-                    }
-                };
-
-                match msg.kind.as_str() {
-                    "interim" | "final" => {
-                        let Some(text) = msg.text else {
-                            continue;
-                        };
-                        let merged = merge_incremental_asr_text(&rough_text, &text);
-                        if merged != rough_text {
-                            let compacted = compact_repeated_sentences(&merged);
-                            if compacted.len() < merged.len() {
-                                tracing::info!(
-                                    before_chars = merged.chars().count(),
-                                    after_chars = compacted.chars().count(),
-                                    "Compacted repeated fragments in ws Doubao rough text"
-                                );
-                            }
-                            rough_text = compacted;
-                            let (next_completed_source_sentences, _) =
-                                split_live_completed_sentences(&rough_text);
-                            let shared_prefix = common_live_sentence_prefix_len(
-                                &completed_source_sentences,
-                                &next_completed_source_sentences,
-                            );
-                            if shared_prefix < completed_source_sentences.len() {
-                                stable_revision.fetch_add(1, Ordering::SeqCst);
-                                completed_source_sentences
-                                    .truncate(shared_prefix);
-                                corrected_display_sentences
-                                    .truncate(shared_prefix);
-                                last_llm_index = None;
-                                last_llm_target.clear();
-                                if let Some(task) = llm_task.take() {
-                                    task.abort();
-                                }
-                            }
-                            if next_completed_source_sentences.len()
-                                < corrected_display_sentences.len()
-                            {
-                                corrected_display_sentences
-                                    .truncate(next_completed_source_sentences.len());
-                            }
-                            completed_source_sentences = next_completed_source_sentences;
-                            maybe_emit_live_display(
-                                &app,
-                                &latest_interim_text,
-                                &mut displayed_text,
-                                &rough_text,
-                                &corrected_display_sentences,
-                                is_valid_session(),
-                            );
-                        }
-                    }
-                    "error" => {
-                        let message = msg.message.unwrap_or_else(|| "unknown".to_string());
-                        tracing::warn!(
-                            "Doubao bridge error: {}",
-                            message
-                        );
-                        if is_doubao_concurrency_quota_error(&message) {
-                            tracing::warn!(
-                                "Doubao realtime WS quota exceeded; disable WS and fallback to chunked interim mode"
-                            );
-                            disable_doubao_ws_for_session();
-                            let _ = child.kill().await;
-                            return false;
-                        }
-                        if rough_text.is_empty() {
-                            let _ = child.kill().await;
-                            return false;
-                        }
-                        bridge_failed = true;
-                        break;
-                    }
-                    "ready" => {}
-                    _ => {}
+                    Some(_) => {}
+                    None => break,
                 }
             }
         }
     }
 
-    if let Some(task) = llm_task.take() {
-        task.abort();
-    }
-
-    let _ = send_doubao_bridge_message(
-        &mut stdin,
-        &DoubaoBridgeInMessage {
-            kind: "end",
-            pcm_b64: None,
-        },
-    )
-    .await;
-    let _ = stdin.shutdown().await;
-
-    // Recorder has stopped, but bridge may still flush the last interim/final packets.
-    // Drain a short tail window so finalization can use the most complete preview text.
-    let tail_deadline = Instant::now() + std::time::Duration::from_millis(1200);
-    while Instant::now() < tail_deadline {
-        let line = match tokio::time::timeout(std::time::Duration::from_millis(90), lines.next_line())
-            .await
-        {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => {
-                tracing::debug!("doubao bridge tail read error: {e}");
-                break;
-            }
-            Err(_) => break,
-        };
-
-        let msg = match serde_json::from_str::<DoubaoBridgeOutMessage>(&line) {
-            Ok(msg) => msg,
-            Err(_) => continue,
-        };
-
-        if !matches!(msg.kind.as_str(), "interim" | "final") {
-            continue;
-        }
-        let Some(text) = msg.text else {
-            continue;
-        };
-
-        let merged = merge_incremental_asr_text(&rough_text, &text);
-        if merged != rough_text {
-            rough_text = compact_repeated_sentences(&merged);
-        }
-    }
-
-    if !rough_text.trim().is_empty() {
-        if let Ok(mut guard) = latest_interim_text.lock() {
-            let composed = compose_live_display_text(&rough_text, &corrected_display_sentences);
-            if !composed.trim().is_empty() {
-                *guard = composed;
-            } else {
-                *guard = rough_text.clone();
+    // Recorder stopped: flush the final tail (any samples captured after the
+    // last tick), then close the session for the final transcript.
+    if let Some(Ok(pcm)) = recorder.snapshot_pcm_from(last_end_sample) {
+        if pcm.end_sample > last_end_sample && !pcm.pcm_s16le.is_empty() {
+            let chunk =
+                convert_pcm_chunk_to_16k_mono_s16le(&pcm.pcm_s16le, pcm.sample_rate, pcm.channels);
+            if !chunk.is_empty() {
+                let _ = session.push_pcm(chunk);
             }
         }
     }
 
-    match tokio::time::timeout(std::time::Duration::from_millis(800), child.wait()).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::debug!("doubao bridge wait error: {e}"),
-        Err(_) => {
-            let _ = child.kill().await;
+    // Keep draining incremental updates while waiting for the final result.
+    let drain = async {
+        while let Some(text) = text_rx.recv().await {
+            if is_valid() {
+                set_interim_with_cache(&app, &latest_interim_text, &text);
+            }
         }
+    };
+    let (final_result, ()) =
+        tokio::join!(session.finish(std::time::Duration::from_secs(6)), drain);
+
+    match final_result {
+        Ok(text) if !text.trim().is_empty() => {
+            if let Ok(mut guard) = latest_interim_text.lock() {
+                *guard = text;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Volcengine session finish failed: {e}"),
     }
 
-    if bridge_failed && is_valid_session() {
-        tracing::warn!("Doubao realtime bridge ended unexpectedly, fallback to chunked interim mode");
-        return false;
+    if is_valid() {
+        let state = app.state::<AppState>();
+        state.stream_final_gen.store(gen_val, Ordering::SeqCst);
     }
-
-    true
 }
 
 fn convert_pcm_chunk_to_16k_mono_s16le(input: &[u8], sample_rate: u32, channels: u16) -> Vec<u8> {
@@ -2332,8 +1715,7 @@ fn convert_pcm_chunk_to_16k_mono_s16le(input: &[u8], sample_rate: u32, channels:
         if src_len == 0 {
             return Vec::new();
         }
-        let dst_len = ((src_len as u64 * 16_000 + sample_rate as u64 - 1) / sample_rate as u64)
-            as usize;
+        let dst_len = (src_len as u64 * 16_000).div_ceil(sample_rate as u64) as usize;
         if dst_len == 0 {
             return Vec::new();
         }
@@ -2359,836 +1741,44 @@ fn convert_pcm_chunk_to_16k_mono_s16le(input: &[u8], sample_rate: u32, channels:
     out
 }
 
-fn merge_incremental_asr_text(existing: &str, latest_window: &str) -> String {
-    let existing_compacted = compact_repeated_sentences(existing.trim());
-    let latest_compacted = compact_repeated_sentences(latest_window.trim());
-    let existing = existing_compacted.trim();
-    let latest = latest_compacted.trim();
-
-    if existing.is_empty() {
-        return latest.to_string();
-    }
-    if latest.is_empty() {
-        return existing.to_string();
-    }
-    if existing == latest || existing.ends_with(latest) {
-        return existing.to_string();
-    }
-    if latest.starts_with(existing) {
-        return latest.to_string();
-    }
-
-    let existing_norm = normalized_alnum_chars_with_offsets(existing);
-    let latest_norm = normalized_alnum_chars_with_offsets(latest);
-    if !existing_norm.is_empty() && !latest_norm.is_empty() {
-        let existing_norm_chars: Vec<char> = existing_norm.iter().map(|(ch, _)| *ch).collect();
-        let latest_norm_chars: Vec<char> = latest_norm.iter().map(|(ch, _)| *ch).collect();
-        let existing_norm_text: String = existing_norm_chars.iter().collect();
-        let latest_norm_text: String = latest_norm_chars.iter().collect();
-
-        if existing_norm_chars == latest_norm_chars
-            || ends_with_chars(&existing_norm_chars, &latest_norm_chars)
-        {
-            return existing.to_string();
-        }
-        if starts_with_chars(&latest_norm_chars, &existing_norm_chars) {
-            return latest.to_string();
-        }
-        if same_or_similar_norm(&existing_norm_text, &latest_norm_text) {
-            return if latest_norm_chars.len() >= existing_norm_chars.len() {
-                latest.to_string()
-            } else {
-                existing.to_string()
-            };
-        }
-
-        let normalized_overlap =
-            longest_suffix_prefix_overlap(&existing_norm_chars, &latest_norm_chars);
-        if normalized_overlap > 0 {
-            let cut_byte = latest_norm[normalized_overlap - 1].1;
-            let latest_tail = latest[cut_byte..].trim_start();
-            if latest_tail.is_empty() {
-                return existing.to_string();
-            }
-
-            let mut merged = existing.to_string();
-            if should_insert_space_between(existing, latest_tail) {
-                merged.push(' ');
-            }
-            merged.push_str(latest_tail);
-            return merged;
-        }
-    }
-
-    let existing_chars: Vec<char> = existing.chars().collect();
-    let latest_chars: Vec<char> = latest.chars().collect();
-    let overlap = longest_suffix_prefix_overlap(&existing_chars, &latest_chars);
-
-    if overlap > 0 {
-        let mut merged: String = existing_chars[..existing_chars.len() - overlap]
-            .iter()
-            .collect();
-        merged.push_str(latest);
-        return merged;
-    }
-
-    if same_or_similar_norm(existing, latest) {
-        return if latest_chars.len() >= existing_chars.len() {
-            latest.to_string()
-        } else {
-            existing.to_string()
-        };
-    }
-
-    if existing_chars.len() > 40 && latest_chars.len() > 40 {
-        tracing::warn!(
-            existing_chars = existing_chars.len(),
-            latest_chars = latest_chars.len(),
-            "Doubao merge fallback append without overlap"
-        );
-    }
-
-    let stable_prefix = stable_prefix_for_incremental_merge(existing);
-    if !stable_prefix.is_empty() {
-        return compact_repeated_sentences(&combine_prefix_tail(&stable_prefix, latest));
-    }
-
-    if latest_chars.len() >= existing_chars.len() {
-        latest.to_string()
-    } else {
-        existing.to_string()
-    }
-}
-
-fn normalized_alnum_chars_with_offsets(text: &str) -> Vec<(char, usize)> {
-    let mut out = Vec::new();
-    for (idx, ch) in text.char_indices() {
-        if ch.is_alphanumeric() {
-            out.push((ch.to_ascii_lowercase(), idx + ch.len_utf8()));
-        }
-    }
-    out
-}
-
-fn starts_with_chars(haystack: &[char], needle: &[char]) -> bool {
-    haystack.len() >= needle.len() && haystack[..needle.len()] == *needle
-}
-
-fn ends_with_chars(haystack: &[char], needle: &[char]) -> bool {
-    haystack.len() >= needle.len() && haystack[haystack.len() - needle.len()..] == *needle
-}
-
-fn stable_prefix_for_incremental_merge(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    let mut boundary_end = 0usize;
-    for (idx, ch) in trimmed.char_indices() {
-        if is_compaction_boundary(ch) {
-            boundary_end = idx + ch.len_utf8();
-        }
-    }
-
-    if boundary_end > 0 && boundary_end < trimmed.len() {
-        return trimmed[..boundary_end].trim_end().to_string();
-    }
-
-    let chars: Vec<char> = trimmed.chars().collect();
-    if chars.len() <= 48 {
-        return String::new();
-    }
-
-    chars[..chars.len() - 48]
-        .iter()
-        .collect::<String>()
-        .trim_end()
-        .to_string()
-}
-
-
-fn longest_suffix_prefix_overlap(left: &[char], right: &[char]) -> usize {
-    let max = left.len().min(right.len());
-    for overlap in (1..=max).rev() {
-        let left_suffix = &left[left.len() - overlap..];
-        let right_prefix = &right[..overlap];
-        if left_suffix == right_prefix {
-            return overlap;
-        }
-        
-        let dist = levenshtein_distance(left_suffix, right_prefix);
-        let allowed_errors = if overlap >= 10 {
-            overlap / 4
-        } else if overlap >= 4 {
-            1
-        } else {
-            0
-        };
-        
-        if dist <= allowed_errors {
-            return overlap;
-        }
-    }
-    0
-}
-
-#[cfg(test)]
-fn split_text_tail_chars(text: &str, tail_chars: usize) -> (String, String) {
-    if tail_chars == 0 {
-        return (text.to_string(), String::new());
-    }
-
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= tail_chars {
-        return (String::new(), text.to_string());
-    }
-
-    let split = chars.len() - tail_chars;
-    let prefix: String = chars[..split].iter().collect();
-    let tail: String = chars[split..].iter().collect();
-    (prefix, tail)
-}
-
-fn combine_prefix_tail(prefix: &str, processed_tail: &str) -> String {
-    let prefix = prefix.trim_end();
-    let tail = processed_tail.trim_start();
-
-    if prefix.is_empty() {
-        return tail.to_string();
-    }
-
-    if tail.is_empty() {
-        return prefix.to_string();
-    }
-
-    if tail.starts_with(prefix) {
-        return tail.to_string();
-    }
-    if prefix.ends_with(tail) {
-        return prefix.to_string();
-    }
-
-    let prefix_chars: Vec<char> = prefix.chars().collect();
-    let tail_chars: Vec<char> = tail.chars().collect();
-    let overlap = longest_suffix_prefix_overlap(&prefix_chars, &tail_chars);
-
-    if overlap > 0 {
-        let mut out = prefix.to_string();
-        for ch in tail_chars.iter().skip(overlap) {
-            out.push(*ch);
-        }
-        return out;
-    }
-
-    let mut out = prefix.to_string();
-    if should_insert_space_between(prefix, tail) {
-        out.push(' ');
-    }
-    out.push_str(tail);
-    out
-}
-
-fn should_insert_space_between(left: &str, right: &str) -> bool {
-    let Some(l) = left.chars().last() else {
-        return false;
-    };
-    let Some(r) = right.chars().next() else {
-        return false;
-    };
-    l.is_ascii_alphanumeric() && r.is_ascii_alphanumeric()
-}
-
-fn is_live_llm_boundary(ch: char) -> bool {
-    matches!(
-        ch,
-        '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';' | '\n'
-    )
-}
-
-fn is_compaction_boundary(ch: char) -> bool {
-    matches!(
-        ch,
-        '。' | '！' | '？' | '；' | '，' | '、' | ',' | ';' | ':' | '：' | '.' | '!' | '?'
-            | '\n'
-    )
-}
-
-#[cfg(test)]
-fn stable_live_prefix(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    let mut boundary_end = None;
-    for (idx, ch) in trimmed.char_indices() {
-        if is_live_llm_boundary(ch) {
-            boundary_end = Some(idx + ch.len_utf8());
-        }
-    }
-
-    boundary_end
-        .map(|end| trimmed[..end].to_string())
-        .unwrap_or_default()
-}
-
-fn push_live_sentence_segment(segments: &mut Vec<String>, segment: String) {
-    let norm = normalize_sentence(&segment);
-    if norm.is_empty() {
-        segments.push(segment);
-        return;
-    }
-
-    if let Some(prev) = segments.last_mut() {
-        let prev_norm = normalize_sentence(prev);
-        if same_or_similar_norm(&prev_norm, &norm) || prev_norm.starts_with(&norm) {
-            return;
-        }
-        if norm.starts_with(&prev_norm) || similar_sentence_score(&prev_norm, &norm) >= 0.82 {
-            *prev = segment;
-            return;
-        }
-    }
-
-    segments.push(segment);
-}
-
-fn split_live_completed_sentences(text: &str) -> (Vec<String>, String) {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return (Vec::new(), String::new());
-    }
-
-    let mut completed = Vec::new();
-    let mut start = 0usize;
-    let mut last_complete_end = 0usize;
-    for (idx, ch) in trimmed.char_indices() {
-        if is_live_llm_boundary(ch) {
-            let end = idx + ch.len_utf8();
-            let segment = trimmed[start..end].trim();
-            if !segment.is_empty() {
-                push_live_sentence_segment(&mut completed, segment.to_string());
-            }
-            start = end;
-            last_complete_end = end;
-        }
-    }
-
-    let tail = trimmed[last_complete_end..].trim().to_string();
-    (completed, tail)
-}
-
-fn same_live_sentence(left: &str, right: &str) -> bool {
-    let left_norm = normalize_sentence(left);
-    let right_norm = normalize_sentence(right);
-    if left_norm.is_empty() || right_norm.is_empty() {
-        return left.trim() == right.trim();
-    }
-
-    same_or_similar_norm(&left_norm, &right_norm)
-}
-
-fn common_live_sentence_prefix_len(existing: &[String], next: &[String]) -> usize {
-    existing
-        .iter()
-        .zip(next.iter())
-        .take_while(|(left, right)| same_live_sentence(left, right))
-        .count()
-}
-
-fn compose_live_display_text(
-    rough_text: &str,
-    corrected_display_sentences: &[String],
-) -> String {
-    let (completed_source_sentences, rough_tail) = split_live_completed_sentences(rough_text);
-    if completed_source_sentences.is_empty() && rough_tail.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::new();
-    for (idx, source_sentence) in completed_source_sentences.iter().enumerate() {
-        let sentence = corrected_display_sentences
-            .get(idx)
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.as_str())
-            .unwrap_or(source_sentence.as_str());
-        out = combine_prefix_tail(&out, sentence);
-    }
-
-    out = combine_prefix_tail(&out, &rough_tail);
-    compact_repeated_sentences(&out)
-}
-
-fn normalize_sentence(sentence: &str) -> String {
-    sentence
-        .chars()
-        .filter(|ch| ch.is_alphanumeric())
-        .flat_map(|ch| ch.to_lowercase())
-        .collect()
-}
-
-fn common_prefix_chars(left: &[char], right: &[char]) -> usize {
-    left.iter()
-        .zip(right.iter())
-        .take_while(|(l, r)| l == r)
-        .count()
-}
-
-fn levenshtein_distance(left: &[char], right: &[char]) -> usize {
-    if left.is_empty() {
-        return right.len();
-    }
-    if right.is_empty() {
-        return left.len();
-    }
-
-    let mut prev: Vec<usize> = (0..=right.len()).collect();
-    let mut curr = vec![0usize; right.len() + 1];
-
-    for (i, left_ch) in left.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, right_ch) in right.iter().enumerate() {
-            let cost = usize::from(left_ch != right_ch);
-            curr[j + 1] = (prev[j + 1] + 1)
-                .min(curr[j] + 1)
-                .min(prev[j] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-
-    prev[right.len()]
-}
-
-fn similar_sentence_score(left_norm: &str, right_norm: &str) -> f32 {
-    if left_norm.is_empty() || right_norm.is_empty() {
-        return 0.0;
-    }
-    if left_norm == right_norm {
-        return 1.0;
-    }
-    if left_norm.contains(right_norm) || right_norm.contains(left_norm) {
-        let min_len = left_norm.chars().count().min(right_norm.chars().count()) as f32;
-        let max_len = left_norm.chars().count().max(right_norm.chars().count()) as f32;
-        return min_len / max_len;
-    }
-
-    let left_chars: Vec<char> = left_norm.chars().collect();
-    let right_chars: Vec<char> = right_norm.chars().collect();
-    let prefix = common_prefix_chars(&left_chars, &right_chars) as f32;
-    let max_len = left_chars.len().max(right_chars.len()) as f32;
-    let prefix_ratio = prefix / max_len;
-    let distance = levenshtein_distance(&left_chars, &right_chars) as f32;
-    let edit_ratio = 1.0 - distance / max_len;
-    prefix_ratio.max(edit_ratio)
-}
-
-fn same_or_similar_norm(left_norm: &str, right_norm: &str) -> bool {
-    left_norm == right_norm
-        || left_norm.starts_with(right_norm)
-        || right_norm.starts_with(left_norm)
-        || (left_norm.chars().count().min(right_norm.chars().count()) >= 8
-            && similar_sentence_score(left_norm, right_norm) >= 0.82)
-}
-
-fn sentence_segments(text: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut start = 0usize;
-    for (idx, ch) in text.char_indices() {
-        if is_compaction_boundary(ch) {
-            let end = idx + ch.len_utf8();
-            let segment = text[start..end].trim();
-            if !segment.is_empty() {
-                segments.push(segment.to_string());
-            }
-            start = end;
-        }
-    }
-
-    let tail = text[start..].trim();
-    if !tail.is_empty() {
-        segments.push(tail.to_string());
-    }
-    segments
-}
-
-fn collapse_repeated_tail_fuzzy(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let total = chars.len();
-    if total < 24 {
-        return text.to_string();
-    }
-
-    let max_block = 120.min(total / 2);
-    for block in (12..=max_block).rev() {
-        let left: String = chars[total - block * 2..total - block].iter().collect();
-        let right: String = chars[total - block..].iter().collect();
-        let left_norm = normalize_sentence(&left);
-        let right_norm = normalize_sentence(&right);
-        if left_norm.is_empty() || right_norm.is_empty() {
-            continue;
-        }
-        if same_or_similar_norm(&left_norm, &right_norm) {
-            let mut out: String = chars[..total - block * 2].iter().collect();
-            out.push_str(right.trim_start());
-            return out;
-        }
-    }
-    text.to_string()
-}
-
-fn compact_repeated_sentences(text: &str) -> String {
-    let mut working = text.trim().to_string();
-    for _ in 0..4 {
-        let collapsed = collapse_repeated_tail_fuzzy(&working);
-        if collapsed == working {
-            break;
-        }
-        working = collapsed;
-    }
-
-    let mut kept: Vec<String> = Vec::new();
-    for segment in sentence_segments(&working) {
-        let norm = normalize_sentence(&segment);
-        if norm.is_empty() {
-            kept.push(segment);
-            continue;
-        }
-
-        let mut handled = false;
-        let start = kept.len().saturating_sub(12);
-        for idx in (start..kept.len()).rev() {
-            let prev_norm = normalize_sentence(&kept[idx]);
-            if prev_norm.is_empty() {
-                continue;
-            }
-
-            if norm == prev_norm {
-                handled = true;
-                break;
-            }
-            if same_or_similar_norm(&norm, &prev_norm) {
-                if norm.len() >= prev_norm.len() {
-                    kept[idx] = segment.clone();
-                }
-                handled = true;
-                break;
-            }
-            if norm.starts_with(&prev_norm) {
-                kept[idx] = segment.clone();
-                handled = true;
-                break;
-            }
-            if prev_norm.starts_with(&norm) {
-                handled = true;
-                break;
-            }
-        }
-
-        if !handled {
-            kept.push(segment);
-        }
-    }
-
-    let joined = kept.join("");
-    collapse_repeated_tail_fuzzy(&joined)
-}
-
-fn maybe_emit_live_display(
-    app: &tauri::AppHandle,
-    latest_interim_text: &Arc<std::sync::Mutex<String>>,
-    displayed_text: &mut String,
-    rough_text: &str,
-    corrected_display_sentences: &[String],
-    can_emit: bool,
-) {
-    if !can_emit {
-        return;
-    }
-
-    let next = compose_live_display_text(rough_text, corrected_display_sentences);
-    if *displayed_text != next {
-        *displayed_text = next.clone();
-        set_interim_with_cache(app, latest_interim_text, &next);
-    }
-}
-
-fn maybe_schedule_live_postprocess(
-    llm_task: &mut Option<tokio::task::JoinHandle<(usize, String, Option<String>)>>,
-    postprocess_spec: &Option<PostprocessSpec>,
-    completed_source_sentences: &[String],
-    corrected_display_sentences: &[String],
-    last_llm_index: &mut Option<usize>,
-    last_llm_target: &mut String,
-    app: &tauri::AppHandle,
-    recorder: &Arc<Recorder>,
-    generation: &Arc<AtomicU64>,
-    gen_val: u64,
-    stable_revision: &Arc<AtomicU64>,
-) {
-    if llm_task.is_some() || postprocess_spec.is_none() {
-        return;
-    }
-
-    let Some((target_index, target_sentence)) = completed_source_sentences
-        .iter()
-        .enumerate()
-        .find(|(idx, sentence)| {
-            !sentence.trim().is_empty() && corrected_display_sentences.get(*idx).is_none()
-        })
-    else {
-        return;
-    };
-
-    if Some(target_index) == *last_llm_index && target_sentence == last_llm_target {
-        return;
-    }
-
-    let app_handle = app.clone();
-    let recorder_ref = Arc::clone(recorder);
-    let generation_ref = Arc::clone(generation);
-    let revision_ref = Arc::clone(stable_revision);
-    let expected_revision = stable_revision.load(Ordering::SeqCst);
-    let target = target_sentence.to_string();
-    let spec = postprocess_spec.clone();
-    *llm_task = Some(tokio::spawn(async move {
-        let processed = postprocess_asr_text_streaming_live(
-            &app_handle,
-            target.clone(),
-            spec,
-            generation_ref.as_ref(),
-            gen_val,
-            recorder_ref.as_ref(),
-            Some((revision_ref.as_ref(), expected_revision)),
-        )
-        .await;
-        (target_index, target, processed)
-    }));
-    *last_llm_index = Some(target_index);
-    *last_llm_target = target_sentence.to_string();
-}
-
-fn build_postprocess_spec(config: &notype_config::AppConfig) -> Option<PostprocessSpec> {
-    if !config.model.enable_doubao_postprocess {
-        return None;
-    }
-
-    let choose_qwen = || {
-        if config.model.qwen_api_key.is_empty() {
-            return None;
-        }
-        let model = if config.model.model_name.starts_with("qwen") {
-            config.model.model_name.clone()
-        } else {
-            DEFAULT_POSTPROCESS_QWEN_MODEL.to_string()
-        };
-        Some(PostprocessSpec {
-            provider: notype_llm::Provider::Qwen,
-            api_key: config.model.qwen_api_key.clone(),
-            model_name: model,
-        })
-    };
-
-    let choose_gemini = || {
-        if config.model.gemini_api_key.is_empty() {
-            return None;
-        }
-        let model = if config.model.model_name.starts_with("gemini") {
-            config.model.model_name.clone()
-        } else {
-            DEFAULT_POSTPROCESS_GEMINI_MODEL.to_string()
-        };
-        Some(PostprocessSpec {
-            provider: notype_llm::Provider::Gemini,
-            api_key: config.model.gemini_api_key.clone(),
-            model_name: model,
-        })
-    };
-
-    match config.model.doubao_postprocess_provider {
-        notype_config::DoubaoPostprocessProvider::Auto
-        | notype_config::DoubaoPostprocessProvider::Qwen => choose_qwen().or_else(choose_gemini),
-        notype_config::DoubaoPostprocessProvider::Gemini => {
-            choose_gemini().or_else(choose_qwen)
-        }
-    }
-}
-
-#[allow(dead_code)]
-async fn postprocess_asr_text_streaming(
-    app: &tauri::AppHandle,
-    raw_text: String,
-    spec: Option<PostprocessSpec>,
-) -> String {
-    let Some(spec) = spec else {
-        tracing::debug!("Doubao ASR post-process skipped");
-        return raw_text;
-    };
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let postprocess_future = notype_llm::postprocess_text_stream(
-        spec.provider,
-        spec.api_key,
-        Some(spec.model_name),
-        POSTPROCESS_SYSTEM_PROMPT.to_string(),
-        raw_text.clone(),
-        tx,
-    );
-    tokio::pin!(postprocess_future);
-
-    let mut streamed = String::new();
-
-    loop {
-        tokio::select! {
-            result = &mut postprocess_future => {
-                while let Ok(chunk) = rx.try_recv() {
-                    streamed.push_str(&chunk);
-                }
-
-                if !streamed.is_empty() {
-                    bubble::set_interim(app, &streamed);
-                }
-
-                match result {
-                    Ok(processed) if !processed.text.trim().is_empty() => {
-                        tracing::info!(chars = processed.text.len(), "LLM post-process completed");
-                        return processed.text;
-                    }
-                    Ok(_) => {
-                        if !streamed.trim().is_empty() {
-                            return streamed;
-                        }
-                        tracing::warn!("LLM post-process returned empty text; fallback to raw ASR");
-                        return raw_text;
-                    }
-                    Err(e) => {
-                        tracing::warn!("LLM post-process failed, fallback to raw ASR: {e}");
-                        if !streamed.trim().is_empty() {
-                            return streamed;
-                        }
-                        return raw_text;
-                    }
-                }
-            }
-            maybe_chunk = rx.recv() => {
-                match maybe_chunk {
-                    Some(chunk) => {
-                        streamed.push_str(&chunk);
-                        bubble::set_interim(app, &streamed);
-                    }
-                    None => {
-                        tokio::task::yield_now().await;
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn postprocess_asr_text_streaming_live(
-    _app: &tauri::AppHandle,
-    raw_text: String,
-    spec: Option<PostprocessSpec>,
-    generation: &AtomicU64,
-    gen_val: u64,
-    recorder: &Recorder,
-    revision: Option<(&AtomicU64, u64)>,
-) -> Option<String> {
-    let Some(spec) = spec else {
-        return Some(raw_text);
-    };
-
-    let is_valid_session = || {
-        let session_ok = generation.load(Ordering::SeqCst) == gen_val && recorder.is_recording();
-        let revision_ok = revision
-            .as_ref()
-            .map(|(counter, expected)| counter.load(Ordering::SeqCst) == *expected)
-            .unwrap_or(true);
-        session_ok && revision_ok
-    };
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let postprocess_future = notype_llm::postprocess_text_stream(
-        spec.provider,
-        spec.api_key,
-        Some(spec.model_name),
-        POSTPROCESS_SYSTEM_PROMPT.to_string(),
-        raw_text.clone(),
-        tx,
-    );
-    tokio::pin!(postprocess_future);
-
-    let mut streamed = String::new();
-
-    loop {
-        tokio::select! {
-            result = &mut postprocess_future => {
-                if !is_valid_session() {
-                    return None;
-                }
-
-                while let Ok(chunk) = rx.try_recv() {
-                    streamed.push_str(&chunk);
-                }
-
-                return match result {
-                    Ok(processed) if !processed.text.trim().is_empty() => Some(processed.text),
-                    Ok(_) => {
-                        if !streamed.trim().is_empty() {
-                            Some(streamed)
-                        } else {
-                            Some(raw_text)
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Live LLM post-process failed, fallback to ASR interim: {e}");
-                        if !streamed.trim().is_empty() {
-                            Some(streamed)
-                        } else {
-                            Some(raw_text)
-                        }
-                    }
-                };
-            }
-            maybe_chunk = rx.recv() => {
-                if !is_valid_session() {
-                    return None;
-                }
-
-                match maybe_chunk {
-                    Some(chunk) => {
-                        streamed.push_str(&chunk);
-                    }
-                    None => {
-                        tokio::task::yield_now().await;
-                    }
-                }
-            }
-        }
-    }
-}
-
-// -- Audio Processing Pipeline --
-
-/// Everything the finalize step needs to know about the session/config,
-/// snapshotted once so late config edits can't change in-flight behavior.
 struct FinalizeCtx {
     from_ui: bool,
     input_mode: notype_config::InputMode,
     auto_copy: bool,
+    /// Press Enter after successful injection (auto-send).
+    auto_enter: bool,
+    /// Deterministic post-replacement rules (applied when nothing was
+    /// stream-typed yet — otherwise the typed prefix would diverge).
+    replace_rules: String,
     provider_label: String,
     model_name: String,
     duration_secs: f32,
 }
 
+/// Finalize a session: record history/stats, inject the text, settle the UI.
+///
+/// `typed_prefix` is what stream-typing already put at the cursor. The
+/// remainder is typed; if typing fails midway the leftover is delivered as a
+/// one-shot paste (the automatic fallback).
 async fn emit_final_text(
     app: &tauri::AppHandle,
     inputter: &TextInputter,
     generation: &AtomicU64,
     gen_at_start: u64,
     text: &str,
+    typed_prefix: &str,
     ctx: &FinalizeCtx,
 ) {
+    // Deterministic hot-rule replacement — only safe when stream typing
+    // hasn't already committed characters to the target app.
+    let replaced;
+    let text = if typed_prefix.is_empty() && !ctx.replace_rules.trim().is_empty() {
+        replaced = notype_config::apply_replace_rules(&ctx.replace_rules, text);
+        replaced.as_str()
+    } else {
+        text
+    };
+
     bubble::set_result(app, text);
     emit_status(app, "Done", Some(text));
 
@@ -3205,6 +1795,14 @@ async fn emit_final_text(
         Err(e) => tracing::warn!("Failed to persist history entry: {e}"),
     }
 
+    // Lifetime stats: total chars / speaking time / streak.
+    match notype_config::stats::record(text.chars().count(), ctx.duration_secs) {
+        Ok(stats) => {
+            let _ = app.emit("notype://stats", StatsDto::from(&stats));
+        }
+        Err(e) => tracing::warn!("Failed to persist stats: {e}"),
+    }
+
     if ctx.from_ui {
         // Dictation mode: the main window has focus, so typing would land in
         // NoType itself. Copy instead; the window shows the text.
@@ -3213,12 +1811,47 @@ async fn emit_final_text(
         }
     } else {
         let inject = match ctx.input_mode {
-            notype_config::InputMode::Keyboard => inputter.type_text(text),
+            notype_config::InputMode::Keyboard => {
+                // Deliver only what stream-typing hasn't already typed.
+                let remaining = if typed_prefix.is_empty() {
+                    Some(text)
+                } else if let Some(rest) = text.strip_prefix(typed_prefix) {
+                    Some(rest)
+                } else {
+                    // Streamed text diverged from the final text (rare) —
+                    // we can't unsay what was typed; leave it as-is.
+                    tracing::warn!(
+                        "Stream-typed text diverged from final text; skipping remainder"
+                    );
+                    None
+                };
+                match remaining {
+                    Some(rest) if !rest.is_empty() => {
+                        inputter.type_text(rest).or_else(|type_err| {
+                            // Automatic one-shot paste fallback.
+                            tracing::warn!(
+                                "Typing failed ({type_err}), falling back to paste"
+                            );
+                            inputter.paste_text(rest)
+                        })
+                    }
+                    _ => Ok(()),
+                }
+            }
             notype_config::InputMode::Clipboard => inputter.paste_text(text),
         };
-        if let Err(e) = inject {
-            tracing::error!("Failed to inject text: {e}");
-            emit_status(app, "Error", Some(&e.to_string()));
+        match inject {
+            Err(e) => {
+                tracing::error!("Failed to inject text: {e}");
+                emit_status(app, "Error", Some(&e.to_string()));
+            }
+            Ok(()) if ctx.auto_enter => {
+                // Auto-send: press Enter after the text lands (chat apps).
+                if let Err(e) = inputter.press_enter() {
+                    tracing::warn!("Auto-enter failed: {e}");
+                }
+            }
+            Ok(()) => {}
         }
         if ctx.auto_copy && ctx.input_mode == notype_config::InputMode::Keyboard {
             if let Err(e) = inputter.copy_text(text) {
@@ -3233,236 +1866,349 @@ async fn emit_final_text(
     emit_status(app, "Ready", None);
 }
 
+/// Build the polish pass spec: which text LLM + which instruction.
+/// Returns `None` when polishing is off, style is verbatim, or no LLM is
+/// configured — the raw ASR text is delivered as-is in that case.
+fn build_postprocess_spec(
+    cfg: &notype_config::AppConfig,
+    app_context: Option<&str>,
+) -> Option<PostprocessSpec> {
+    if !cfg.model.enable_postprocess {
+        return None;
+    }
+
+    let system_prompt = match cfg.general.output_style {
+        // Verbatim: raw ASR text IS the desired output.
+        notype_config::OutputStyle::Verbatim => return None,
+        notype_config::OutputStyle::TranslateEn => POSTPROCESS_TRANSLATE_PROMPT.to_string(),
+        notype_config::OutputStyle::Polish => {
+            // Reuse the user's rules + vocabulary so both pipelines share
+            // one set of formatting/correction knowledge.
+            let mut parts = vec![
+                POSTPROCESS_SYSTEM_PROMPT.to_string(),
+                cfg.prompts.rules_text().to_string(),
+                cfg.prompts.vocabulary_text().to_string(),
+            ];
+            if cfg.general.enable_app_context {
+                if let Some(target) = app_context.map(str::trim).filter(|s| !s.is_empty()) {
+                    parts.push(format!(
+                        "## 当前输入场景\n用户正在「{}」中输入文字。{}",
+                        target,
+                        notype_config::resolve_app_tone(target, &cfg.general.app_rules)
+                    ));
+                }
+            }
+            if !cfg.general.structured_output {
+                parts.push(notype_config::UNSTRUCTURED_DIRECTIVE.to_string());
+            }
+            parts.retain(|s| !s.trim().is_empty());
+            parts.join("\n\n")
+        }
+    };
+
+    choose_text_llm(cfg).map(|target| PostprocessSpec {
+        target,
+        system_prompt,
+    })
+}
+
+/// Drive a streaming text future to completion while mirroring chunks to the
+/// bubble preview and (optionally) typing them at the cursor as they arrive.
+/// Returns `(final_text, typed_prefix)`.
+async fn consume_text_stream<F>(
+    app: &tauri::AppHandle,
+    inputter: &TextInputter,
+    fut: F,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    stream_type: bool,
+) -> (notype_llm::Result<String>, String)
+where
+    F: std::future::Future<Output = notype_llm::Result<notype_llm::RecognitionResult>>,
+{
+    tokio::pin!(fut);
+
+    let mut streamed = String::new();
+    let mut typed = String::new();
+    let mut type_failed = false;
+
+    let outcome = loop {
+        tokio::select! {
+            result = &mut fut => {
+                // Drain whatever is still queued in the channel.
+                while let Ok(chunk) = rx.try_recv() {
+                    streamed.push_str(&chunk);
+                    if stream_type && !type_failed {
+                        if inputter.type_text(&chunk).is_ok() {
+                            typed.push_str(&chunk);
+                        } else {
+                            type_failed = true;
+                        }
+                    }
+                }
+                if !streamed.is_empty() {
+                    bubble::set_interim(app, &streamed);
+                }
+                break result.map(|r| {
+                    if r.text.trim().is_empty() && !streamed.trim().is_empty() {
+                        streamed.clone()
+                    } else {
+                        r.text
+                    }
+                });
+            }
+            maybe_chunk = rx.recv() => {
+                match maybe_chunk {
+                    Some(chunk) => {
+                        streamed.push_str(&chunk);
+                        bubble::set_interim(app, &streamed);
+                        if stream_type && !type_failed {
+                            if inputter.type_text(&chunk).is_ok() {
+                                typed.push_str(&chunk);
+                            } else {
+                                tracing::warn!("Stream typing failed; remainder will be pasted");
+                                type_failed = true;
+                            }
+                        }
+                    }
+                    None => tokio::task::yield_now().await,
+                }
+            }
+        }
+    };
+
+    (outcome, typed)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_audio(
     app: &tauri::AppHandle,
     recognizer: &tokio::sync::RwLock<Option<Box<dyn VoiceRecognizer>>>,
     config: &tokio::sync::RwLock<notype_config::AppConfig>,
     inputter: &TextInputter,
-    gateway_process: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
     latest_interim_text: &std::sync::Mutex<String>,
+    stream_final_gen: &AtomicU64,
     generation: &AtomicU64,
     audio: notype_audio::AudioData,
     from_ui: bool,
 ) {
     let gen_at_start = generation.load(Ordering::SeqCst);
-    let (
-        system_prompt,
-        active_provider,
-        base_url,
-        credential_path,
-        gateway_api_key,
-        should_manage_gateway,
-        using_doubao_ws_realtime,
-        finalize_ctx,
-    ) = {
+    let (system_prompt, active_provider, is_asr, postprocess_spec, stream_typing, finalize_ctx) = {
         let cfg = config.read().await;
         let provider_label = match cfg.model.provider {
             notype_config::Provider::Gemini => "gemini",
             notype_config::Provider::Qwen => "qwen",
             notype_config::Provider::Mimo => "mimo",
-            notype_config::Provider::Doubao => "doubao",
+            notype_config::Provider::Volcengine => "volcengine",
+            notype_config::Provider::Whisper => "whisper",
+            notype_config::Provider::Apple => "apple",
+        };
+        let active_app = {
+            let state = app.state::<AppState>();
+            let value = state.active_app.lock().ok().and_then(|g| g.clone());
+            value
         };
         (
-            cfg.prompts.compose(),
+            compose_session_prompt(app, &cfg),
             cfg.model.provider.clone(),
-            cfg.model.doubao_base_url.clone(),
-            cfg.model.doubao_ime_credential_path.clone(),
-            cfg.model.doubao_api_key.clone(),
-            should_manage_local_doubao_gateway(&cfg),
-            should_use_doubao_ws_realtime(&cfg),
+            cfg.model.is_asr_pipeline(),
+            build_postprocess_spec(&cfg, active_app.as_deref()),
+            cfg.general.stream_typing,
             FinalizeCtx {
                 from_ui,
                 input_mode: cfg.general.input_mode.clone(),
                 auto_copy: cfg.general.auto_copy,
+                auto_enter: cfg.general.auto_enter,
+                replace_rules: cfg.prompts.replace_rules.clone(),
                 provider_label: provider_label.to_string(),
                 model_name: cfg.model.model_name.clone(),
                 duration_secs: audio.duration_secs,
             },
         )
     };
-    let is_doubao_provider = matches!(active_provider, notype_config::Provider::Doubao);
-    let mut latest_preview = read_cached_interim_text(latest_interim_text);
+    // Stream typing only makes sense when we're typing at a foreign cursor.
+    let can_stream_type = stream_typing
+        && !from_ui
+        && finalize_ctx.input_mode == notype_config::InputMode::Keyboard;
 
-    // WS realtime mode should finalize from cached preview, not a second ASR request.
-    // Wait for WS tail flush first, then read preview again.
-    if is_doubao_provider && using_doubao_ws_realtime {
-        let ws_idle = wait_for_doubao_ws_idle(std::time::Duration::from_millis(4500)).await;
-        latest_preview = wait_for_nonempty_interim_text(
-            latest_interim_text,
-            std::time::Duration::from_millis(1500),
-        )
-        .await;
-        if !ws_idle && latest_preview.is_empty() {
-            tracing::warn!(
-                "Doubao WS still active and preview empty after finalize wait; skip fallback ASR request"
-            );
-            bubble::hide_bubble(app);
-            emit_status(app, "Ready", None);
-            return;
-        }
-        if ws_idle && latest_preview.is_empty() {
-            tracing::debug!(
-                "Doubao WS settled with empty preview; wait briefly before fallback final ASR"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-            latest_preview = wait_for_nonempty_interim_text(
-                latest_interim_text,
-                std::time::Duration::from_millis(600),
-            )
-            .await;
-        }
-    }
-
-    if is_doubao_provider && !latest_preview.is_empty() {
-        tracing::info!(
-            chars = latest_preview.chars().count(),
-            "Finalize Doubao transcription from live preview"
-        );
-        emit_final_text(
-            app,
-            inputter,
-            generation,
-            gen_at_start,
-            &latest_preview,
-            &finalize_ctx,
-        )
-        .await;
-        return;
-    }
-
-    let guard = recognizer.read().await;
-    let Some(rec) = guard.as_ref() else {
-        tracing::warn!("No recognizer configured");
-        bubble::set_error(app, "No recognizer credentials configured");
-        emit_status(app, "Error", Some("No recognizer credentials configured"));
-        auto_hide_bubble(app, generation, gen_at_start, 3).await;
-        return;
+    let settle_empty = |app: &tauri::AppHandle| {
+        tracing::info!("Empty transcription (silence?)");
+        bubble::hide_bubble(app);
+        emit_status(app, "Ready", None);
     };
 
-    if should_manage_gateway {
-        if let Err(e) = ensure_local_doubao_gateway_running(
-            gateway_process,
-            base_url,
-            credential_path,
-            gateway_api_key,
-        )
-        .await
+    // -- Stage 1: obtain raw text --
+    let is_volc = matches!(active_provider, notype_config::Provider::Volcengine);
+    let raw_text: Result<String, String> = if is_volc {
+        // The live session already has the audio; wait for its final flush.
+        let deadline = Instant::now() + std::time::Duration::from_secs(8);
+        while Instant::now() < deadline
+            && stream_final_gen.load(Ordering::SeqCst) != gen_at_start
+            && generation.load(Ordering::SeqCst) == gen_at_start
         {
-            tracing::warn!("Failed to ensure local doubao-asr2api gateway before final recognition: {e}");
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         }
-    }
+        if generation.load(Ordering::SeqCst) != gen_at_start {
+            return; // superseded by a newer session
+        }
 
-    // Use streaming to get SSE chunks, but display final result directly
-    // (interim preview already shown during recording)
-    let mut attempts = 0usize;
-    let result = loop {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let run_result = if is_doubao_provider {
-            let _serial_guard = doubao_asr_serial_mutex().lock().await;
-            let out = rec
-                .recognize_stream(audio.wav_bytes.clone(), "audio/wav".into(), system_prompt.clone(), tx)
-                .await;
-            drop(_serial_guard);
-            out
+        let preview = read_cached_interim_text(latest_interim_text);
+        if stream_final_gen.load(Ordering::SeqCst) == gen_at_start && !preview.is_empty() {
+            Ok(preview)
         } else {
-            rec.recognize_stream(audio.wav_bytes.clone(), "audio/wav".into(), system_prompt.clone(), tx)
+            // Live session produced nothing — replay the recording once.
+            tracing::warn!("Volcengine live session yielded no text; batch fallback");
+            let guard = recognizer.read().await;
+            match guard.as_ref() {
+                Some(rec) => rec
+                    .recognize(audio.wav_bytes.clone(), "audio/wav".into(), String::new())
+                    .await
+                    .map(|r| r.text)
+                    .map_err(|e| e.to_string()),
+                None => Err("未配置识别引擎".into()),
+            }
+        }
+    } else if is_asr {
+        // Batch ASR engines (Whisper-compatible / Apple / Qwen-ASR).
+        let guard = recognizer.read().await;
+        match guard.as_ref() {
+            Some(rec) => rec
+                .recognize(audio.wav_bytes.clone(), "audio/wav".into(), String::new())
                 .await
+                .map(|r| r.text)
+                .map_err(|e| e.to_string()),
+            None => Err("未配置识别引擎".into()),
+        }
+    } else {
+        // -- Multimodal single-pass: recognize + polish in one streaming call --
+        let guard = recognizer.read().await;
+        let Some(rec) = guard.as_ref() else {
+            bubble::set_error(app, "未配置识别引擎凭证");
+            emit_status(app, "Error", Some("未配置识别引擎凭证"));
+            auto_hide_bubble(app, generation, gen_at_start, 3).await;
+            return;
         };
 
-        if is_doubao_provider {
-            if let Err(err) = &run_result {
-                let message = err.to_string();
-                if is_doubao_concurrency_quota_error(&message) && attempts < DOUBAO_QUOTA_RETRY_ATTEMPTS {
-                    attempts += 1;
-                    let delay = std::time::Duration::from_millis(
-                        DOUBAO_QUOTA_RETRY_BASE_DELAY_MS * attempts as u64,
-                    );
-                    tracing::warn!(
-                        attempt = attempts,
-                        delay_ms = delay.as_millis(),
-                        "Doubao final recognition hit ExceededConcurrentQuota, retrying"
-                    );
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let fut = rec.recognize_stream(
+            audio.wav_bytes.clone(),
+            "audio/wav".into(),
+            system_prompt.clone(),
+            tx,
+        );
+        let (outcome, typed) =
+            consume_text_stream(app, inputter, fut, rx, can_stream_type).await;
+        drop(guard);
+
+        match outcome {
+            Ok(text) if text.trim().is_empty() => {
+                settle_empty(app);
+            }
+            Ok(text) => {
+                emit_final_text(
+                    app,
+                    inputter,
+                    generation,
+                    gen_at_start,
+                    text.trim(),
+                    &typed,
+                    &finalize_ctx,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::error!("Recognition failed: {e}");
+                bubble::set_error(app, &e.to_string());
+                emit_status(app, "Error", Some(&e.to_string()));
+                auto_hide_bubble(app, generation, gen_at_start, 5).await;
             }
         }
-
-        break run_result;
+        return;
     };
 
-    match result {
-        Ok(result) if result.text.is_empty() => {
-            tracing::info!("Empty transcription (silence?)");
-            bubble::hide_bubble(app);
-            emit_status(app, "Ready", None);
+    // -- Stage 2 (ASR pipelines): polish the raw text, then deliver --
+    let raw = match raw_text {
+        Ok(text) if text.trim().is_empty() => {
+            settle_empty(app);
+            return;
         }
-        Ok(result) => {
-            tracing::info!(text = %result.text, "ASR transcription received");
-            let final_text = result.text;
-
-            if final_text.trim().is_empty() {
-                tracing::info!("Empty final text after post-process");
-                bubble::hide_bubble(app);
-                emit_status(app, "Ready", None);
-                return;
-            }
-
-            emit_final_text(
-                app,
-                inputter,
-                generation,
-                gen_at_start,
-                &final_text,
-                &finalize_ctx,
-            )
-            .await;
-        }
+        // Hot-rules run on the raw ASR text so corrections reach the LLM too.
+        Ok(text) => notype_config::apply_replace_rules(
+            &finalize_ctx.replace_rules,
+            text.trim(),
+        ),
         Err(e) => {
-            let error_msg = e.to_string();
-            if is_doubao_concurrency_quota_error(&error_msg) {
-                tracing::warn!("Suppressing Doubao concurrency quota error in finalize path");
-                bubble::hide_bubble(app);
-                emit_status(app, "Ready", None);
+            // Last resort: whatever the live preview captured.
+            let fallback = read_cached_interim_text(latest_interim_text);
+            if !fallback.trim().is_empty() {
+                tracing::warn!(error = %e, "ASR failed; falling back to live preview text");
+                fallback
+            } else {
+                tracing::error!("Recognition failed: {e}");
+                bubble::set_error(app, &e);
+                emit_status(app, "Error", Some(&e));
+                auto_hide_bubble(app, generation, gen_at_start, 5).await;
                 return;
             }
+        }
+    };
 
-            if is_doubao_provider {
-                let mut fallback_text = read_cached_interim_text(latest_interim_text);
-                if fallback_text.is_empty() {
-                    fallback_text = wait_for_nonempty_interim_text(
-                        latest_interim_text,
-                        std::time::Duration::from_millis(1600),
+    match postprocess_spec {
+        Some(spec) => {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let fut = notype_llm::postprocess_text_stream_to(
+                &spec.target,
+                spec.system_prompt.clone(),
+                raw.clone(),
+                tx,
+            );
+            let (outcome, typed) =
+                consume_text_stream(app, inputter, fut, rx, can_stream_type).await;
+
+            match outcome {
+                Ok(text) if !text.trim().is_empty() => {
+                    emit_final_text(
+                        app,
+                        inputter,
+                        generation,
+                        gen_at_start,
+                        text.trim(),
+                        &typed,
+                        &finalize_ctx,
                     )
                     .await;
                 }
-
-                if !fallback_text.is_empty() {
-                    tracing::warn!(
-                        error = %e,
-                        chars = fallback_text.chars().count(),
-                        "Final Doubao recognition failed, fallback to latest interim text"
-                    );
-                    if !fallback_text.trim().is_empty() {
-                        emit_final_text(
-                            app,
-                            inputter,
-                            generation,
-                            gen_at_start,
-                            &fallback_text,
-                            &finalize_ctx,
-                        )
-                        .await;
-                        return;
-                    }
+                Ok(_) => {
+                    // Polish produced nothing — deliver the raw ASR text,
+                    // accounting for anything stream-typing already typed.
+                    emit_final_text(
+                        app,
+                        inputter,
+                        generation,
+                        gen_at_start,
+                        &raw,
+                        &typed,
+                        &finalize_ctx,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!("Polish pass failed ({e}); delivering raw ASR text");
+                    emit_final_text(
+                        app,
+                        inputter,
+                        generation,
+                        gen_at_start,
+                        &raw,
+                        &typed,
+                        &finalize_ctx,
+                    )
+                    .await;
                 }
             }
-
-            tracing::error!("Recognition failed: {e}");
-            bubble::set_error(app, &e.to_string());
-            emit_status(app, "Error", Some(&e.to_string()));
-            auto_hide_bubble(app, generation, gen_at_start, 5).await;
+        }
+        None => {
+            emit_final_text(app, inputter, generation, gen_at_start, &raw, "", &finalize_ctx)
+                .await;
         }
     }
 }
@@ -3496,26 +2242,29 @@ fn build_recognizer(config: &notype_config::AppConfig) -> Option<Box<dyn VoiceRe
         notype_config::Provider::Gemini => notype_llm::Provider::Gemini,
         notype_config::Provider::Qwen => notype_llm::Provider::Qwen,
         notype_config::Provider::Mimo => notype_llm::Provider::Mimo,
-        notype_config::Provider::Doubao => notype_llm::Provider::Doubao,
+        notype_config::Provider::Volcengine => notype_llm::Provider::Volcengine,
+        notype_config::Provider::Whisper => notype_llm::Provider::Whisper,
+        notype_config::Provider::Apple => notype_llm::Provider::Apple,
+    };
+
+    // Whisper engines have a dedicated model field; others share model_name.
+    let model = match config.model.provider {
+        notype_config::Provider::Whisper => Some(config.model.whisper_model.clone()),
+        _ => Some(config.model.model_name.clone()),
     };
 
     Some(notype_llm::create_recognizer(
         provider,
         config.model.active_api_key().to_string(),
         notype_llm::RecognizerOptions {
-            model: Some(config.model.model_name.clone()),
+            model,
+            qwen_base_url: Some(config.model.qwen_base_url.clone()),
             mimo_base_url: Some(config.model.mimo_base_url.clone()),
-            doubao_base_url: Some(config.model.doubao_base_url.clone()),
-            doubao_official_app_key: if config.model.doubao_official_app_key.is_empty() {
-                None
-            } else {
-                Some(config.model.doubao_official_app_key.clone())
-            },
-            doubao_official_access_key: if config.model.doubao_official_access_key.is_empty() {
-                None
-            } else {
-                Some(config.model.doubao_official_access_key.clone())
-            },
+            volc_app_key: Some(config.model.volc_app_key.clone()),
+            volc_access_key: Some(config.model.volc_access_key.clone()),
+            volc_resource_id: Some(config.model.volc_resource_id.clone()),
+            whisper_base_url: Some(config.model.whisper_base_url.clone()),
+            apple_locale: Some(config.model.apple_locale.clone()),
         },
     ))
 }
@@ -3524,13 +2273,20 @@ fn build_recognizer(config: &notype_config::AppConfig) -> Option<Box<dyn VoiceRe
 fn reregister_shortcut(
     app: &tauri::AppHandle,
     hotkey_str: &str,
+    edit_hotkey_str: &str,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
     let shortcut = parse_hotkey(hotkey_str)?;
-    // Unregister all, then re-register the new one
+    let edit_shortcut = resolve_edit_shortcut(edit_hotkey_str, &shortcut);
+    // Unregister all, then re-register the new set
     app.global_shortcut().unregister_all()?;
     app.global_shortcut().register(shortcut)?;
+    if let Some(edit_sc) = edit_shortcut {
+        if let Err(e) = app.global_shortcut().register(edit_sc) {
+            tracing::warn!("Failed to re-register voice-edit hotkey: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -3538,6 +2294,7 @@ fn reregister_shortcut(
 fn reregister_shortcut(
     _app: &tauri::AppHandle,
     _hotkey_str: &str,
+    _edit_hotkey_str: &str,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
@@ -3662,111 +2419,3 @@ fn key_to_code(key: &str) -> std::result::Result<tauri_plugin_global_shortcut::C
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        combine_prefix_tail, compact_repeated_sentences, compose_live_display_text,
-        merge_incremental_asr_text, split_live_completed_sentences, split_text_tail_chars,
-        stable_live_prefix,
-    };
-
-    #[test]
-    fn split_tail_chars_splits_expected_window() {
-        let (prefix, tail) = split_text_tail_chars("abcdef", 3);
-        assert_eq!(prefix, "abc");
-        assert_eq!(tail, "def");
-    }
-
-    #[test]
-    fn combine_prefix_tail_joins_text() {
-        assert_eq!(combine_prefix_tail("hello ", "world"), "hello world");
-        assert_eq!(combine_prefix_tail("", "  test"), "test");
-    }
-
-    #[test]
-    fn combine_prefix_tail_avoids_duplicate_overlap() {
-        assert_eq!(
-            combine_prefix_tail("输入两个方括号，然后", "然后可以继续输入"),
-            "输入两个方括号，然后可以继续输入"
-        );
-        assert_eq!(
-            combine_prefix_tail("今天我们讨论接口", "今天我们讨论接口和缓存"),
-            "今天我们讨论接口和缓存"
-        );
-    }
-
-    #[test]
-    fn combine_prefix_tail_does_not_insert_space_for_cjk() {
-        assert_eq!(
-            combine_prefix_tail("这是中文前缀", "继续输出"),
-            "这是中文前缀继续输出"
-        );
-    }
-
-    #[test]
-    fn merge_incremental_text_handles_overlap() {
-        let merged = merge_incremental_asr_text("今天我们讨论", "我们讨论一下接口");
-        assert_eq!(merged, "今天我们讨论一下接口");
-    }
-
-    #[test]
-    fn merge_incremental_text_handles_punctuation_drift() {
-        let merged = merge_incremental_asr_text(
-            "连接出来。用好这个功能，笔记之间的关系图谱",
-            "连接出来, 用好这个功能，笔记之间的关系图谱会变得非常复杂",
-        );
-        assert_eq!(merged, "连接出来,用好这个功能，笔记之间的关系图谱会变得非常复杂");
-    }
-
-    #[test]
-    fn merge_incremental_text_without_overlap_keeps_stable_prefix() {
-        let merged = merge_incremental_asr_text(
-            "这是第一句已经稳定。第二句还在讨论缓存和索引策略",
-            "现在继续讨论数据库连接池和超时配置",
-        );
-        assert_eq!(merged, "这是第一句已经稳定。现在继续讨论数据库连接池和超时配置");
-    }
-
-    #[test]
-    fn stable_live_prefix_stops_at_latest_clause_boundary() {
-        assert_eq!(
-            stable_live_prefix("粗转录第一句。第二句还没说完"),
-            "粗转录第一句。"
-        );
-        assert_eq!(stable_live_prefix("前半句，后半句继续"), "");
-    }
-
-    #[test]
-    fn compose_live_display_uses_corrected_prefix_and_raw_tail() {
-        let displayed = compose_live_display_text(
-            "这是粗转录第一句。第二句还没说完",
-            &[String::from("这是修正后的第一句。")],
-        );
-        assert_eq!(displayed, "这是修正后的第一句。第二句还没说完");
-    }
-
-    #[test]
-    fn split_live_completed_sentences_compacts_repeated_sentences() {
-        let (completed, tail) = split_live_completed_sentences(
-            "该怎么去形容你最贴切？该怎么去形容你最贴切？拿什么做比较才算特别",
-        );
-        assert_eq!(completed, vec!["该怎么去形容你最贴切？"]);
-        assert_eq!(tail, "拿什么做比较才算特别");
-    }
-
-    #[test]
-    fn compact_repeated_sentences_skips_duplicate_questions() {
-        let compacted = compact_repeated_sentences(
-            "该怎么去形容你最贴切？该怎么去形容你最贴切？拿什么做比较才算特别？拿什么做比较才算特别？",
-        );
-        assert_eq!(compacted, "该怎么去形容你最贴切？拿什么做比较才算特别？");
-    }
-
-    #[test]
-    fn compact_repeated_sentences_keeps_longer_extension() {
-        let compacted = compact_repeated_sentences(
-            "拿什么做比较才算特别？拿什么做比较才算特别对你？",
-        );
-        assert_eq!(compacted, "拿什么做比较才算特别对你？");
-    }
-}

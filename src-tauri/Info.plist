@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>NoType 需要使用麦克风进行语音输入</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>NoType 使用 Apple 本地语音识别将你的语音转为文字（仅在选择 Apple Speech 引擎时）</string>
+</dict>
+</plist>

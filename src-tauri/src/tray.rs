@@ -33,7 +33,7 @@ pub fn create_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     // Open the window first so the user sees the live transcript.
                     show_main_window(app);
-                    if let Err(e) = crate::start_capture(app, true) {
+                    if let Err(e) = crate::start_capture(app, true, false) {
                         tracing::warn!("Tray start dictation failed: {e}");
                     }
                 }

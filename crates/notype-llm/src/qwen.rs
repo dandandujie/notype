@@ -14,26 +14,41 @@ use tokio::sync::mpsc;
 use crate::{LlmError, RecognitionResult, Result, VoiceRecognizer};
 
 const DEFAULT_MODEL: &str = "qwen3.5-omni-flash";
-const API_BASE: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const MAX_RETRIES: u32 = 2;
 
+/// OpenAI-compatible chat client. Default endpoint is DashScope, but any
+/// compatible service works via `base_url` — locally deployed Qwen (vLLM,
+/// SGLang) or arbitrary OpenAI-compatible LLM vendors for post-processing.
 pub struct QwenClient {
     api_key: String,
     model: String,
+    base_url: String,
     client: reqwest::Client,
 }
 
 impl QwenClient {
     pub fn new(api_key: String, model: Option<String>) -> Self {
+        Self::with_base_url(api_key, model, None)
+    }
+
+    pub fn with_base_url(api_key: String, model: Option<String>, base_url: Option<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .unwrap_or_default();
+        let base_url = base_url
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| DEFAULT_BASE_URL.into());
         Self {
             api_key,
-            model: model.unwrap_or_else(|| DEFAULT_MODEL.into()),
+            model: model
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_MODEL.into()),
+            base_url,
             client,
         }
     }
@@ -78,7 +93,7 @@ impl QwenClient {
             "max_tokens": 8192
         });
 
-        let url = format!("{API_BASE}/chat/completions");
+        let url = format!("{}/chat/completions", self.base_url);
         tracing::debug!(model = %self.model, "Sending text post-process request to Qwen (streaming)");
         let text = self.send_stream(&url, &body, Some(tx)).await?;
         Ok(RecognitionResult { text })
@@ -116,7 +131,7 @@ impl QwenClient {
             "max_tokens": 8192
         });
 
-        let url = format!("{API_BASE}/chat/completions");
+        let url = format!("{}/chat/completions", self.base_url);
         tracing::debug!(model = %self.model, audio_bytes = audio_data.len(), "Sending to Qwen (streaming)");
 
         let text = self.send_stream(&url, &body, tx).await?;

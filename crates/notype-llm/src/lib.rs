@@ -1,12 +1,19 @@
-//! LLM API client module for NoType.
+//! ASR + LLM client module for NoType.
 //!
-//! Abstracts multimodal/ASR providers (Gemini, Qwen, MiMo, Doubao) behind a unified
-//! trait for voice-to-text recognition.
+//! Two kinds of engines behind one trait:
+//! - Multimodal LLMs that transcribe + polish in one call (Gemini, Qwen-Omni, MiMo)
+//! - Dedicated ASR engines whose raw text is polished by a separate LLM pass
+//!   (Volcengine streaming, Whisper-compatible batch, Apple Speech, Qwen-ASR)
+//!
+//! Post-processing (`postprocess_text_stream`) accepts any OpenAI-compatible
+//! chat endpoint, so the polish step works with arbitrary LLM vendors.
 
-pub mod doubao;
+pub mod apple;
 pub mod gemini;
 pub mod mimo;
 pub mod qwen;
+pub mod volcengine;
+pub mod whisper;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -38,6 +45,7 @@ pub struct RecognitionResult {
 /// Unified trait for voice recognition providers (object-safe).
 pub trait VoiceRecognizer: Send + Sync {
     /// Recognize speech from audio data with a custom system prompt.
+    /// ASR-only engines ignore the prompt.
     fn recognize(
         &self,
         audio_data: Vec<u8>,
@@ -56,25 +64,35 @@ pub trait VoiceRecognizer: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<RecognitionResult>> + Send + '_>>;
 }
 
-/// Supported LLM providers.
+/// Supported recognition providers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Provider {
     Gemini,
     Qwen,
     Mimo,
-    Doubao,
+    Volcengine,
+    Whisper,
+    Apple,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RecognizerOptions {
     pub model: Option<String>,
+    /// Custom OpenAI-compatible endpoint for Qwen (cloud default: DashScope).
+    pub qwen_base_url: Option<String>,
     pub mimo_base_url: Option<String>,
-    pub doubao_base_url: Option<String>,
-    pub doubao_official_app_key: Option<String>,
-    pub doubao_official_access_key: Option<String>,
+    /// Volcengine streaming ASR credentials.
+    pub volc_app_key: Option<String>,
+    pub volc_access_key: Option<String>,
+    pub volc_resource_id: Option<String>,
+    /// Whisper-compatible endpoint root (e.g. https://api.openai.com/v1).
+    pub whisper_base_url: Option<String>,
+    /// Apple Speech locale (empty = system default).
+    pub apple_locale: Option<String>,
 }
 
-/// Create a recognizer from provider config.
+/// Create a recognizer from provider config. `api_key` is the key of the
+/// selected provider (Volcengine uses the dedicated volc_* options instead).
 pub fn create_recognizer(
     provider: Provider,
     api_key: String,
@@ -82,54 +100,83 @@ pub fn create_recognizer(
 ) -> Box<dyn VoiceRecognizer> {
     match provider {
         Provider::Gemini => Box::new(gemini::GeminiClient::new(api_key, options.model)),
-        Provider::Qwen => Box::new(qwen::QwenClient::new(api_key, options.model)),
+        Provider::Qwen => Box::new(qwen::QwenClient::with_base_url(
+            api_key,
+            options.model,
+            options.qwen_base_url,
+        )),
         Provider::Mimo => Box::new(mimo::MimoClient::new(
             api_key,
             options.model,
             options.mimo_base_url,
         )),
-        Provider::Doubao => Box::new(doubao::DoubaoClient::new(
+        Provider::Volcengine => Box::new(volcengine::VolcengineClient::new(
+            options.volc_app_key.unwrap_or_default(),
+            options.volc_access_key.unwrap_or_default(),
+            options.volc_resource_id,
+        )),
+        Provider::Whisper => Box::new(whisper::WhisperClient::new(
             api_key,
             options.model,
-            options.doubao_base_url,
-            options.doubao_official_app_key,
-            options.doubao_official_access_key,
+            options.whisper_base_url,
         )),
+        Provider::Apple => Box::new(apple::AppleSpeechClient::new(options.apple_locale)),
     }
 }
 
-/// Stream post-processing for ASR raw text.
-/// Currently supported providers: Gemini, Qwen, MiMo.
-pub async fn postprocess_text_stream(
-    provider: Provider,
-    api_key: String,
-    model: Option<String>,
+/// A text-capable LLM endpoint for the polish/post-process pass.
+/// `base_url = None` selects each provider's official endpoint; any
+/// OpenAI-compatible service works by setting `base_url`.
+#[derive(Debug, Clone)]
+pub struct TextLlmTarget {
+    pub kind: TextLlmKind,
+    pub api_key: String,
+    pub model: String,
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextLlmKind {
+    /// Any OpenAI-compatible chat/completions endpoint (incl. DashScope/Qwen).
+    OpenAiCompatible,
+    Gemini,
+    Mimo,
+}
+
+/// Stream post-processing for ASR raw text through the chosen text LLM.
+pub async fn postprocess_text_stream_to(
+    target: &TextLlmTarget,
     system_prompt: String,
     raw_text: String,
     tx: mpsc::UnboundedSender<String>,
 ) -> Result<RecognitionResult> {
-    match provider {
-        Provider::Gemini => {
-            let client = gemini::GeminiClient::new(api_key, model);
+    match target.kind {
+        TextLlmKind::OpenAiCompatible => {
+            let client = qwen::QwenClient::with_base_url(
+                target.api_key.clone(),
+                Some(target.model.clone()),
+                target.base_url.clone(),
+            );
             client
                 .postprocess_text_stream(system_prompt, raw_text, tx)
                 .await
         }
-        Provider::Qwen => {
-            let client = qwen::QwenClient::new(api_key, model);
+        TextLlmKind::Gemini => {
+            let client = gemini::GeminiClient::new(target.api_key.clone(), Some(target.model.clone()));
             client
                 .postprocess_text_stream(system_prompt, raw_text, tx)
                 .await
         }
-        Provider::Mimo => {
-            let client = mimo::MimoClient::new(api_key, model, None);
+        TextLlmKind::Mimo => {
+            let client = mimo::MimoClient::new(
+                target.api_key.clone(),
+                Some(target.model.clone()),
+                target.base_url.clone(),
+            );
             client
                 .postprocess_text_stream(system_prompt, raw_text, tx)
                 .await
         }
-        Provider::Doubao => Err(LlmError::ModelNotAvailable(
-            "Doubao ASR is not a text post-process provider".into(),
-        )),
     }
 }
 

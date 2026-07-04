@@ -96,6 +96,16 @@ pub fn delete(id: u64) -> std::io::Result<Vec<HistoryEntry>> {
     Ok(entries)
 }
 
+/// Replace the text of one entry (user correction). Returns the full list.
+pub fn update_text(id: u64, text: &str) -> std::io::Result<Vec<HistoryEntry>> {
+    let mut entries = load();
+    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+        entry.text = text.to_string();
+    }
+    save(&entries)?;
+    Ok(entries)
+}
+
 /// Remove every entry.
 pub fn clear() -> std::io::Result<()> {
     save(&[])

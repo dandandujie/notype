@@ -4,38 +4,67 @@
 
 [general]
 hotkey = "Ctrl+."
+# 语音编辑快捷键：选中文本按住说指令，松开后替换选中内容。留空禁用
+edit_hotkey = "Ctrl+,"
 # "keyboard" = 模拟键盘逐字输入; "clipboard" = 剪贴板粘贴（长文本更快，但会覆盖剪贴板）
 input_mode = "keyboard"
 # 指定麦克风设备名，留空使用系统默认
 audio_device = ""
 # 键盘输入完成后是否同时把结果复制到剪贴板
 auto_copy = false
+# 输出风格: "polish" 智能整理 | "verbatim" 逐字 | "translate_en" 译英
+output_style = "polish"
+# 应用场景感知：根据正在输入的应用调整语气与排版（macOS）
+enable_app_context = true
+# 结构化输出：允许列表 / 步骤排版；关闭则只按语义分段
+structured_output = true
+# 流式逐字输出：AI 边生成边打字；打字失败自动回退为一次性粘贴
+stream_typing = true
+# 自动发送：输入完成后自动按回车（聊天场景说完即发）
+auto_enter = false
+# 应用语气规则（覆盖内置映射），每行一条：应用关键词 = 语气描述
+app_rules = ""
+# 提示音（开始/完成/出错的合成音）
+sound_feedback = true
 
 [model]
-provider = "qwen"     # "gemini" or "qwen" or "mimo" or "doubao"
+# 识别引擎: "qwen" | "gemini" | "mimo" | "volcengine" | "whisper" | "apple"
+provider = "qwen"
+# 多模态引擎的模型名（volcengine/whisper/apple 不使用此字段）
+# Qwen 可选: qwen3.5-omni-flash / qwen3.5-omni-plus（多模态直识别）
+#           qwen3-asr-flash（专用 ASR，走 LLM 润色管线）
 model_name = "qwen3.5-omni-flash"
 
-# Each provider has its own API key
+# ---- 多模态 / 混合引擎 ----
 gemini_api_key = ""   # https://ai.google.dev
-qwen_api_key = ""     # https://dashscope.aliyuncs.com
+qwen_api_key = ""     # https://dashscope.aliyuncs.com（本地部署可留空）
+# Qwen 接入点：默认 DashScope 云端；本地部署（vLLM/SGLang）改成本地地址
+qwen_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 mimo_api_key = ""     # https://platform.xiaomimimo.com
 mimo_base_url = "https://api.xiaomimimo.com/v1"
 
-# Doubao ASR (asr2api gateway mode)
-doubao_base_url = "http://127.0.0.1:8000"
-doubao_api_key = ""   # Optional (OpenTypeless / doubao-asr-api gateway key)
+# ---- Volcengine 流式 ASR（火山引擎豆包大模型语音识别，官方 API）----
+volc_app_key = ""      # 火山控制台 APP ID
+volc_access_key = ""   # 火山控制台 Access Token
+# 小时版 volc.bigasr.sauc.duration | 并发版 volc.bigasr.sauc.concurrent
+# 2.0 模型换成 volc.seedasr.sauc.duration / concurrent
+volc_resource_id = "volc.bigasr.sauc.duration"
 
-# Doubao official file ASR mode
-doubao_official_app_key = ""
-doubao_official_access_key = ""
+# ---- OpenAI Whisper 兼容批量 ASR ----
+# 兼容 OpenAI / Groq / whisper.cpp server / faster-whisper 等 /v1/audio/transcriptions 服务
+whisper_base_url = "https://api.openai.com/v1"
+whisper_api_key = ""   # 本地服务可留空
+whisper_model = "whisper-1"
 
-# Optional LLM post-process keys when provider = doubao (recommended for semantic cleanup)
-# Set false to run ASR-only (skip semantic cleanup step).
-enable_doubao_postprocess = true
-# "auto" | "qwen" | "gemini"
-doubao_postprocess_provider = "auto"
-# Auto mode uses qwen first, then gemini if qwen key is empty.
+# ---- Apple Speech（macOS 本地识别，免费离线）----
+# BCP-47 语言代码，留空跟随系统，如 "zh-CN" / "en-US"
+apple_locale = ""
 
-# Realtime preview via doubaoime-asr websocket bridge (while holding hotkey)
-enable_doubao_realtime_ws = true
-doubao_ime_credential_path = "~/.config/doubaoime-asr/credentials.json"
+# ---- LLM 润色（对 ASR 引擎生效：volcengine / whisper / apple / qwen3-asr）----
+enable_postprocess = true
+# "auto"（自定义→Qwen→Gemini→MiMo）| "custom" | "qwen" | "gemini" | "mimo"
+postprocess_provider = "auto"
+# 自定义润色服务：任意 OpenAI 兼容厂商（DeepSeek / Moonshot / OpenRouter / 本地 Ollama…）
+custom_llm_base_url = ""   # 如 https://api.deepseek.com/v1
+custom_llm_api_key = ""
+custom_llm_model = ""      # 如 deepseek-chat
