@@ -199,6 +199,8 @@ fn macos_mouse_position() -> (f64, f64) {
 
 #[cfg(target_os = "windows")]
 fn windows_mouse_position() -> (f64, f64) {
+    // Win32 API struct keeps its canonical name.
+    #[allow(clippy::upper_case_acronyms)]
     #[repr(C)]
     struct POINT {
         x: i32,
