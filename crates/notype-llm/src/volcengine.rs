@@ -107,9 +107,12 @@ fn parse_server_frame(data: &[u8]) -> Result<ServerFrame> {
             if data.len() < offset + 4 {
                 return Ok(ServerFrame::Other);
             }
-            let size =
-                u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
-                    as usize;
+            let size = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
             offset += 4;
             if data.len() < offset + size {
                 return Ok(ServerFrame::Other);
@@ -135,12 +138,19 @@ fn parse_server_frame(data: &[u8]) -> Result<ServerFrame> {
             if data.len() < offset + 8 {
                 return Err(LlmError::RequestFailed("volc error frame truncated".into()));
             }
-            let code =
-                u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+            let code = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
             offset += 4;
-            let size =
-                u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
-                    as usize;
+            let size = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
             offset += 4;
             let raw = data.get(offset..offset + size).unwrap_or_default();
             let message = gunzip(raw)
@@ -228,9 +238,7 @@ async fn next_frame(ws: &mut WsStream) -> Result<Option<ServerFrame>> {
             Some(Ok(Message::Binary(data))) => return parse_server_frame(&data).map(Some),
             Some(Ok(Message::Close(_))) | None => return Ok(None),
             Some(Ok(_)) => continue, // ping/pong/text — ignore
-            Some(Err(e)) => {
-                return Err(LlmError::RequestFailed(format!("volc ws read: {e}")))
-            }
+            Some(Err(e)) => return Err(LlmError::RequestFailed(format!("volc ws read: {e}"))),
         }
     }
 }
@@ -250,10 +258,7 @@ enum SessionCmd {
 impl VolcStreamSession {
     /// Connect and spawn the pump task. `text_tx` receives every incremental
     /// full-text update (already cumulative — replace, don't append).
-    pub async fn start(
-        config: VolcConfig,
-        text_tx: mpsc::UnboundedSender<String>,
-    ) -> Result<Self> {
+    pub async fn start(config: VolcConfig, text_tx: mpsc::UnboundedSender<String>) -> Result<Self> {
         let mut ws = connect(&config).await?;
         let (pcm_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
         let (final_tx, final_rx) = tokio::sync::oneshot::channel::<Result<String>>();
@@ -359,8 +364,12 @@ fn parse_wav(bytes: &[u8]) -> Result<(u32, u16, Vec<u8>)> {
 
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
-        let size = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]])
-            as usize;
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
         let body_start = pos + 8;
         let body_end = (body_start + size).min(bytes.len());
         match id {
@@ -459,7 +468,9 @@ impl VolcengineClient {
         let (rate, channels, pcm) = parse_wav(&audio_data)?;
         let pcm16k = to_16k_mono(&pcm, rate, channels);
         if pcm16k.is_empty() {
-            return Ok(RecognitionResult { text: String::new() });
+            return Ok(RecognitionResult {
+                text: String::new(),
+            });
         }
 
         let (text_tx, mut text_rx) = mpsc::unbounded_channel::<String>();
@@ -482,12 +493,13 @@ impl VolcengineClient {
             }
         };
 
-        let (final_text, ()) = tokio::join!(
-            session.finish(std::time::Duration::from_secs(30)),
-            forward
-        );
+        let (final_text, ()) =
+            tokio::join!(session.finish(std::time::Duration::from_secs(30)), forward);
         let text = final_text?;
-        tracing::info!(chars = text.chars().count(), "Volcengine transcription received");
+        tracing::info!(
+            chars = text.chars().count(),
+            "Volcengine transcription received"
+        );
         Ok(RecognitionResult { text })
     }
 }

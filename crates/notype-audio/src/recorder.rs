@@ -172,15 +172,14 @@ fn audio_thread(
             Command::Start => {
                 // GOTCHA: fall back to the default device if the named one unplugged,
                 // instead of failing the whole recording session.
-                let device = match device::get_device(device_name.as_deref())
-                    .or_else(|e| {
-                        if device_name.is_some() {
-                            tracing::warn!("Named device unavailable ({e}), falling back to default");
-                            device::get_device(None)
-                        } else {
-                            Err(e)
-                        }
-                    }) {
+                let device = match device::get_device(device_name.as_deref()).or_else(|e| {
+                    if device_name.is_some() {
+                        tracing::warn!("Named device unavailable ({e}), falling back to default");
+                        device::get_device(None)
+                    } else {
+                        Err(e)
+                    }
+                }) {
                     Ok(d) => d,
                     Err(e) => {
                         tracing::error!("Failed to get audio device: {e}");

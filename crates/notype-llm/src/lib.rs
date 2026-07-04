@@ -162,7 +162,8 @@ pub async fn postprocess_text_stream_to(
                 .await
         }
         TextLlmKind::Gemini => {
-            let client = gemini::GeminiClient::new(target.api_key.clone(), Some(target.model.clone()));
+            let client =
+                gemini::GeminiClient::new(target.api_key.clone(), Some(target.model.clone()));
             client
                 .postprocess_text_stream(system_prompt, raw_text, tx)
                 .await

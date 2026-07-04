@@ -128,8 +128,10 @@ fn recognize_blocking(wav_bytes: &[u8], locale: &str) -> Result<String> {
 
         let ns_path = NSString::from_str(&path.to_string_lossy());
         let url = NSURL::fileURLWithPath(&ns_path);
-        let request =
-            SFSpeechURLRecognitionRequest::initWithURL(SFSpeechURLRecognitionRequest::alloc(), &url);
+        let request = SFSpeechURLRecognitionRequest::initWithURL(
+            SFSpeechURLRecognitionRequest::alloc(),
+            &url,
+        );
 
         let handler = RcBlock::new(
             move |result: *mut objc2_speech::SFSpeechRecognitionResult,
@@ -154,7 +156,10 @@ fn recognize_blocking(wav_bytes: &[u8], locale: &str) -> Result<String> {
 
         match result_rx.recv_timeout(std::time::Duration::from_secs(120)) {
             Ok(Ok(text)) => {
-                tracing::info!(chars = text.chars().count(), "Apple Speech transcription received");
+                tracing::info!(
+                    chars = text.chars().count(),
+                    "Apple Speech transcription received"
+                );
                 Ok(text.trim().to_string())
             }
             Ok(Err(msg)) => {
@@ -162,7 +167,9 @@ fn recognize_blocking(wav_bytes: &[u8], locale: &str) -> Result<String> {
                 if msg.contains("No speech") || msg.contains("1110") {
                     Ok(String::new())
                 } else {
-                    Err(LlmError::RequestFailed(format!("Apple 语音识别失败: {msg}")))
+                    Err(LlmError::RequestFailed(format!(
+                        "Apple 语音识别失败: {msg}"
+                    )))
                 }
             }
             Err(_) => Err(LlmError::RequestFailed("Apple 语音识别超时".into())),

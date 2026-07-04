@@ -160,7 +160,12 @@ pub enum Provider {
     #[serde(rename = "mimo", alias = "Mimo", alias = "MiMo", alias = "xiaomi")]
     Mimo,
     /// Volcengine streaming ASR. Aliases keep old "doubao" configs loading.
-    #[serde(rename = "volcengine", alias = "volc", alias = "doubao", alias = "Doubao")]
+    #[serde(
+        rename = "volcengine",
+        alias = "volc",
+        alias = "doubao",
+        alias = "Doubao"
+    )]
     Volcengine,
     #[serde(rename = "whisper", alias = "openai")]
     Whisper,
@@ -458,26 +463,81 @@ pub fn app_tone_hint(app_name: &str) -> &'static str {
     let name = app_name.to_lowercase();
 
     const CHAT: &[&str] = &[
-        "微信", "wechat", "qq", "telegram", "discord", "slack", "whatsapp",
-        "imessage", "信息", "messages", "钉钉", "dingtalk", "飞书", "lark",
-        "messenger", "signal",
+        "微信",
+        "wechat",
+        "qq",
+        "telegram",
+        "discord",
+        "slack",
+        "whatsapp",
+        "imessage",
+        "信息",
+        "messages",
+        "钉钉",
+        "dingtalk",
+        "飞书",
+        "lark",
+        "messenger",
+        "signal",
     ];
     const MAIL: &[&str] = &["mail", "邮件", "outlook", "gmail", "spark", "airmail"];
     const CODE: &[&str] = &[
-        "cursor", "code", "vscode", "xcode", "intellij", "pycharm", "webstorm",
-        "goland", "rustrover", "zed", "sublime", "vim", "neovim", "terminal",
-        "iterm", "warp", "kitty", "alacritty", "ghostty",
+        "cursor",
+        "code",
+        "vscode",
+        "xcode",
+        "intellij",
+        "pycharm",
+        "webstorm",
+        "goland",
+        "rustrover",
+        "zed",
+        "sublime",
+        "vim",
+        "neovim",
+        "terminal",
+        "iterm",
+        "warp",
+        "kitty",
+        "alacritty",
+        "ghostty",
     ];
     const NOTES: &[&str] = &[
-        "备忘录", "notes", "notion", "obsidian", "logseq", "bear", "typora",
-        "onenote", "evernote", "印象笔记", "flomo", "craft", "ulysses",
+        "备忘录",
+        "notes",
+        "notion",
+        "obsidian",
+        "logseq",
+        "bear",
+        "typora",
+        "onenote",
+        "evernote",
+        "印象笔记",
+        "flomo",
+        "craft",
+        "ulysses",
     ];
     const DOCS: &[&str] = &[
-        "word", "pages", "docs", "wps", "石墨", "腾讯文档", "语雀", "yuque",
+        "word",
+        "pages",
+        "docs",
+        "wps",
+        "石墨",
+        "腾讯文档",
+        "语雀",
+        "yuque",
     ];
     const AI: &[&str] = &[
-        "chatgpt", "claude", "gemini", "copilot", "豆包", "kimi", "元宝",
-        "perplexity", "poe", "chatbox",
+        "chatgpt",
+        "claude",
+        "gemini",
+        "copilot",
+        "豆包",
+        "kimi",
+        "元宝",
+        "perplexity",
+        "poe",
+        "chatbox",
     ];
 
     let hit = |list: &[&str]| list.iter().any(|k| name.contains(k));
@@ -726,13 +786,23 @@ fn apply_env_overrides(config: &mut AppConfig) {
         ("NOTYPE_MIMO_BASE_URL", |c, v| c.model.mimo_base_url = v),
         ("NOTYPE_VOLC_APP_KEY", |c, v| c.model.volc_app_key = v),
         ("NOTYPE_VOLC_ACCESS_KEY", |c, v| c.model.volc_access_key = v),
-        ("NOTYPE_VOLC_RESOURCE_ID", |c, v| c.model.volc_resource_id = v),
-        ("NOTYPE_WHISPER_BASE_URL", |c, v| c.model.whisper_base_url = v),
+        ("NOTYPE_VOLC_RESOURCE_ID", |c, v| {
+            c.model.volc_resource_id = v
+        }),
+        ("NOTYPE_WHISPER_BASE_URL", |c, v| {
+            c.model.whisper_base_url = v
+        }),
         ("NOTYPE_WHISPER_API_KEY", |c, v| c.model.whisper_api_key = v),
         ("NOTYPE_WHISPER_MODEL", |c, v| c.model.whisper_model = v),
-        ("NOTYPE_CUSTOM_LLM_BASE_URL", |c, v| c.model.custom_llm_base_url = v),
-        ("NOTYPE_CUSTOM_LLM_API_KEY", |c, v| c.model.custom_llm_api_key = v),
-        ("NOTYPE_CUSTOM_LLM_MODEL", |c, v| c.model.custom_llm_model = v),
+        ("NOTYPE_CUSTOM_LLM_BASE_URL", |c, v| {
+            c.model.custom_llm_base_url = v
+        }),
+        ("NOTYPE_CUSTOM_LLM_API_KEY", |c, v| {
+            c.model.custom_llm_api_key = v
+        }),
+        ("NOTYPE_CUSTOM_LLM_MODEL", |c, v| {
+            c.model.custom_llm_model = v
+        }),
     ];
     for (name, apply) in overrides {
         if let Ok(value) = std::env::var(name) {
@@ -817,10 +887,16 @@ mod tests {
     #[test]
     fn test_apply_replace_rules() {
         let rules = "含数 = 函数\n/(\\d+)块(\\d+)/ = $1.$2元\n# 注释行\n无效行没有等号";
-        assert_eq!(apply_replace_rules(rules, "这个含数返回9块5"), "这个函数返回9.5元");
+        assert_eq!(
+            apply_replace_rules(rules, "这个含数返回9块5"),
+            "这个函数返回9.5元"
+        );
         // 无效正则被跳过，不影响其他规则
         let bad = "/[unclosed = x\n派森 = Python";
-        assert_eq!(apply_replace_rules(bad, "用派森写"), "用 Python 写".replace(" ", ""));
+        assert_eq!(
+            apply_replace_rules(bad, "用派森写"),
+            "用 Python 写".replace(" ", "")
+        );
     }
 
     #[test]

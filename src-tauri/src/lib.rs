@@ -84,7 +84,6 @@ fn read_cached_interim_text(latest_interim_text: &std::sync::Mutex<String>) -> S
         .unwrap_or_default()
 }
 
-
 #[derive(Clone)]
 struct PostprocessSpec {
     target: notype_llm::TextLlmTarget,
@@ -375,13 +374,12 @@ fn choose_text_llm(cfg: &notype_config::AppConfig) -> Option<notype_llm::TextLlm
         if cfg.model.qwen_api_key.is_empty() && !cfg.model.qwen_is_custom_endpoint() {
             return None;
         }
-        let model = if cfg.model.model_name.starts_with("qwen")
-            && !cfg.model.model_name.contains("asr")
-        {
-            cfg.model.model_name.clone()
-        } else {
-            DEFAULT_POSTPROCESS_QWEN_MODEL.to_string()
-        };
+        let model =
+            if cfg.model.model_name.starts_with("qwen") && !cfg.model.model_name.contains("asr") {
+                cfg.model.model_name.clone()
+            } else {
+                DEFAULT_POSTPROCESS_QWEN_MODEL.to_string()
+            };
         Some(TextLlmTarget {
             kind: TextLlmKind::OpenAiCompatible,
             api_key: cfg.model.qwen_api_key.clone(),
@@ -424,10 +422,9 @@ fn choose_text_llm(cfg: &notype_config::AppConfig) -> Option<notype_llm::TextLlm
         notype_config::PostprocessProvider::Qwen => qwen(),
         notype_config::PostprocessProvider::Gemini => gemini(),
         notype_config::PostprocessProvider::Mimo => mimo(),
-        notype_config::PostprocessProvider::Auto => custom()
-            .or_else(qwen)
-            .or_else(gemini)
-            .or_else(mimo),
+        notype_config::PostprocessProvider::Auto => {
+            custom().or_else(qwen).or_else(gemini).or_else(mimo)
+        }
     }
 }
 
@@ -494,15 +491,10 @@ async fn process_edit_audio(
                 Ok(r) if !r.text.trim().is_empty() => {
                     if let Some(target) = text_target {
                         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                        notype_llm::postprocess_text_stream_to(
-                            &target,
-                            system_prompt,
-                            r.text,
-                            tx,
-                        )
-                        .await
-                        .map(|out| out.text)
-                        .map_err(|e| e.to_string())
+                        notype_llm::postprocess_text_stream_to(&target, system_prompt, r.text, tx)
+                            .await
+                            .map(|out| out.text)
+                            .map_err(|e| e.to_string())
                     } else {
                         Err("语音编辑需要配置润色 LLM（自定义 / Qwen / Gemini / MiMo）".into())
                     }
@@ -531,8 +523,16 @@ async fn process_edit_audio(
                 model_name,
                 duration_secs: audio.duration_secs,
             };
-            emit_final_text(app, inputter, generation, gen_at_start, text.trim(), "", &ctx)
-                .await;
+            emit_final_text(
+                app,
+                inputter,
+                generation,
+                gen_at_start,
+                text.trim(),
+                "",
+                &ctx,
+            )
+            .await;
         }
         Ok(_) => {
             tracing::info!("Voice edit produced empty result");
@@ -550,7 +550,10 @@ async fn process_edit_audio(
 
 /// Toggle dictation from the main window. Returns `true` if now recording.
 #[tauri::command]
-fn toggle_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<bool, String> {
+fn toggle_recording(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
     if state.recorder.is_recording() {
         stop_capture(&app)?;
         Ok(false)
@@ -901,8 +904,8 @@ async fn save_config(
 ) -> Result<SaveResult, String> {
     let mut config = state.config.write().await;
 
-    let hotkey_changed = config.general.hotkey != dto.hotkey
-        || config.general.edit_hotkey != dto.edit_hotkey;
+    let hotkey_changed =
+        config.general.hotkey != dto.hotkey || config.general.edit_hotkey != dto.edit_hotkey;
 
     config.model.provider = match dto.provider.to_lowercase().as_str() {
         "qwen" => notype_config::Provider::Qwen,
@@ -984,9 +987,11 @@ async fn save_config(
 
     // Apply microphone selection (effective on next recording).
     let device = config.general.audio_device.clone();
-    state
-        .recorder
-        .set_device(if device.is_empty() { None } else { Some(device) });
+    state.recorder.set_device(if device.is_empty() {
+        None
+    } else {
+        Some(device)
+    });
 
     // Rebuild recognizer
     let new_recognizer = build_recognizer(&config);
@@ -1462,8 +1467,15 @@ async fn interim_loop(
     };
 
     if matches!(provider, notype_config::Provider::Volcengine) {
-        interim_loop_volcengine(app, recorder, config, latest_interim_text, generation, gen_val)
-            .await;
+        interim_loop_volcengine(
+            app,
+            recorder,
+            config,
+            latest_interim_text,
+            generation,
+            gen_val,
+        )
+        .await;
     } else {
         interim_loop_default(
             app,
@@ -1580,14 +1592,14 @@ async fn interim_loop_volcengine(
     }
 
     let (text_tx, mut text_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let session =
-        match notype_llm::volcengine::VolcStreamSession::start(volc_config, text_tx).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("Volcengine live session failed to start: {e}");
-                return;
-            }
-        };
+    let session = match notype_llm::volcengine::VolcStreamSession::start(volc_config, text_tx).await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("Volcengine live session failed to start: {e}");
+            return;
+        }
+    };
 
     let mut last_end_sample = 0usize;
     let mut pcm_interval = tokio::time::interval(VOLC_PCM_INTERVAL);
@@ -1658,8 +1670,7 @@ async fn interim_loop_volcengine(
             }
         }
     };
-    let (final_result, ()) =
-        tokio::join!(session.finish(std::time::Duration::from_secs(6)), drain);
+    let (final_result, ()) = tokio::join!(session.finish(std::time::Duration::from_secs(6)), drain);
 
     match final_result {
         Ok(text) if !text.trim().is_empty() => {
@@ -1829,9 +1840,7 @@ async fn emit_final_text(
                     Some(rest) if !rest.is_empty() => {
                         inputter.type_text(rest).or_else(|type_err| {
                             // Automatic one-shot paste fallback.
-                            tracing::warn!(
-                                "Typing failed ({type_err}), falling back to paste"
-                            );
+                            tracing::warn!("Typing failed ({type_err}), falling back to paste");
                             inputter.paste_text(rest)
                         })
                     }
@@ -2026,9 +2035,8 @@ async fn process_audio(
         )
     };
     // Stream typing only makes sense when we're typing at a foreign cursor.
-    let can_stream_type = stream_typing
-        && !from_ui
-        && finalize_ctx.input_mode == notype_config::InputMode::Keyboard;
+    let can_stream_type =
+        stream_typing && !from_ui && finalize_ctx.input_mode == notype_config::InputMode::Keyboard;
 
     let settle_empty = |app: &tauri::AppHandle| {
         tracing::info!("Empty transcription (silence?)");
@@ -2095,8 +2103,7 @@ async fn process_audio(
             system_prompt.clone(),
             tx,
         );
-        let (outcome, typed) =
-            consume_text_stream(app, inputter, fut, rx, can_stream_type).await;
+        let (outcome, typed) = consume_text_stream(app, inputter, fut, rx, can_stream_type).await;
         drop(guard);
 
         match outcome {
@@ -2132,10 +2139,7 @@ async fn process_audio(
             return;
         }
         // Hot-rules run on the raw ASR text so corrections reach the LLM too.
-        Ok(text) => notype_config::apply_replace_rules(
-            &finalize_ctx.replace_rules,
-            text.trim(),
-        ),
+        Ok(text) => notype_config::apply_replace_rules(&finalize_ctx.replace_rules, text.trim()),
         Err(e) => {
             // Last resort: whatever the live preview captured.
             let fallback = read_cached_interim_text(latest_interim_text);
@@ -2207,8 +2211,16 @@ async fn process_audio(
             }
         }
         None => {
-            emit_final_text(app, inputter, generation, gen_at_start, &raw, "", &finalize_ctx)
-                .await;
+            emit_final_text(
+                app,
+                inputter,
+                generation,
+                gen_at_start,
+                &raw,
+                "",
+                &finalize_ctx,
+            )
+            .await;
         }
     }
 }
@@ -2418,4 +2430,3 @@ fn key_to_code(key: &str) -> std::result::Result<tauri_plugin_global_shortcut::C
         _ => Err(format!("Unknown key: {key}")),
     }
 }
-

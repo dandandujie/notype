@@ -29,7 +29,10 @@ pub fn frontmost_app_name() -> Option<String> {
         if workspace.is_null() {
             return None;
         }
-        let app = objc_msg_send(workspace, sel_registerName(c"frontmostApplication".as_ptr()));
+        let app = objc_msg_send(
+            workspace,
+            sel_registerName(c"frontmostApplication".as_ptr()),
+        );
         if app.is_null() {
             return None;
         }
