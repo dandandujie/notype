@@ -10,6 +10,7 @@
 
 pub mod apple;
 pub mod gemini;
+pub mod gpt_realtime;
 pub mod mimo;
 pub mod qwen;
 pub mod volcengine;
@@ -73,6 +74,7 @@ pub enum Provider {
     Volcengine,
     Whisper,
     Apple,
+    GptRealtime,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -89,6 +91,8 @@ pub struct RecognizerOptions {
     pub whisper_base_url: Option<String>,
     /// Apple Speech locale (empty = system default).
     pub apple_locale: Option<String>,
+    /// OpenAI API key for the Realtime transcription engine.
+    pub openai_api_key: Option<String>,
 }
 
 /// Create a recognizer from provider config. `api_key` is the key of the
@@ -121,6 +125,10 @@ pub fn create_recognizer(
             options.whisper_base_url,
         )),
         Provider::Apple => Box::new(apple::AppleSpeechClient::new(options.apple_locale)),
+        Provider::GptRealtime => Box::new(gpt_realtime::GptRealtimeClient::new(
+            options.openai_api_key.unwrap_or(api_key),
+            options.model,
+        )),
     }
 }
 

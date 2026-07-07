@@ -1038,9 +1038,9 @@ body::after {
   gap: 2px;
 }
 
-/* 六引擎两行排布 */
+/* 多引擎按钮换行排布（7 个 → 每行 2 个整齐分布） */
 .seg.seg-provider {
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
 }
 
 .seg-btn {

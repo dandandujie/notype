@@ -18,6 +18,8 @@ interface Config {
   whisper_api_key: string;
   whisper_model: string;
   apple_locale: string;
+  openai_api_key: string;
+  openai_realtime_model: string;
   enable_postprocess: boolean;
   postprocess_provider: string;
   custom_llm_base_url: string;
@@ -42,6 +44,7 @@ interface Config {
   has_mimo_key: boolean;
   has_volc_keys: boolean;
   has_whisper_key: boolean;
+  has_openai_key: boolean;
   has_custom_llm_key: boolean;
 }
 
@@ -155,6 +158,9 @@ const whisperApiKeyEl = $<HTMLInputElement>("whisper-api-key");
 const whisperKeyHint = $("whisper-key-hint");
 const whisperModelEl = $<HTMLInputElement>("whisper-model");
 const appleLocaleEl = $<HTMLInputElement>("apple-locale");
+const openaiApiKeyEl = $<HTMLInputElement>("openai-api-key");
+const openaiKeyHint = $("openai-key-hint");
+const openaiRealtimeModelEl = $<HTMLSelectElement>("openai-realtime-model");
 const postprocessEnabledEl = $<HTMLInputElement>("postprocess-enabled");
 const structuredOutputEl = $<HTMLInputElement>("structured-output");
 const postprocessProviderEl = $<HTMLSelectElement>("postprocess-provider");
@@ -1181,6 +1187,7 @@ function syncModels() {
   $("volc-fields").hidden = currentProvider !== "volcengine";
   $("whisper-fields").hidden = currentProvider !== "whisper";
   $("apple-fields").hidden = currentProvider !== "apple";
+  $("gpt-realtime-fields").hidden = currentProvider !== "gpt_realtime";
 }
 
 function syncCustomLlmFields() {
@@ -1332,6 +1339,8 @@ settingsForm.addEventListener("submit", async (e) => {
         whisper_api_key: whisperApiKeyEl.value,
         whisper_model: whisperModelEl.value,
         apple_locale: appleLocaleEl.value,
+        openai_api_key: openaiApiKeyEl.value,
+        openai_realtime_model: openaiRealtimeModelEl.value,
         enable_postprocess: postprocessEnabledEl.checked,
         postprocess_provider: postprocessProviderEl.value,
         custom_llm_base_url: customLlmBaseUrlEl.value,
@@ -1356,6 +1365,7 @@ settingsForm.addEventListener("submit", async (e) => {
         has_mimo_key: true,
         has_volc_keys: true,
         has_whisper_key: true,
+        has_openai_key: true,
         has_custom_llm_key: true,
       },
     });
@@ -1396,6 +1406,10 @@ settingsForm.addEventListener("submit", async (e) => {
     if (whisperApiKeyEl.value) {
       whisperApiKeyEl.value = "";
       setKeyHint(whisperApiKeyEl, whisperKeyHint, true, true);
+    }
+    if (openaiApiKeyEl.value) {
+      openaiApiKeyEl.value = "";
+      setKeyHint(openaiApiKeyEl, openaiKeyHint, true);
     }
     if (customLlmApiKeyEl.value) {
       customLlmApiKeyEl.value = "";
@@ -1526,6 +1540,7 @@ async function init() {
   whisperBaseUrlEl.value = config.whisper_base_url || "https://api.openai.com/v1";
   whisperModelEl.value = config.whisper_model || "whisper-1";
   appleLocaleEl.value = config.apple_locale || "";
+  openaiRealtimeModelEl.value = config.openai_realtime_model || "gpt-4o-transcribe";
   postprocessEnabledEl.checked = config.enable_postprocess;
   structuredOutputEl.checked = config.structured_output;
   postprocessProviderEl.value = config.postprocess_provider || "auto";
@@ -1553,6 +1568,7 @@ async function init() {
   setKeyHint(volcAppKeyEl, volcAppKeyHint, config.has_volc_keys);
   setKeyHint(volcAccessKeyEl, volcAccessKeyHint, config.has_volc_keys);
   setKeyHint(whisperApiKeyEl, whisperKeyHint, config.has_whisper_key, true);
+  setKeyHint(openaiApiKeyEl, openaiKeyHint, config.has_openai_key);
   setKeyHint(customLlmApiKeyEl, customLlmKeyHint, config.has_custom_llm_key);
 
   syncModels();

@@ -623,6 +623,7 @@ async fn quick_setup(
         "volcengine" => notype_config::Provider::Volcengine,
         "whisper" => notype_config::Provider::Whisper,
         "apple" => notype_config::Provider::Apple,
+        "gpt_realtime" | "realtime" => notype_config::Provider::GptRealtime,
         other => return Err(format!("未知引擎: {other}")),
     };
     // Sensible default model per provider.
@@ -641,6 +642,7 @@ async fn quick_setup(
             notype_config::Provider::Gemini => config.model.gemini_api_key = key.to_string(),
             notype_config::Provider::Mimo => config.model.mimo_api_key = key.to_string(),
             notype_config::Provider::Whisper => config.model.whisper_api_key = key.to_string(),
+            notype_config::Provider::GptRealtime => config.model.openai_api_key = key.to_string(),
             _ => {}
         }
     }
@@ -911,8 +913,9 @@ async fn save_config(
         "qwen" => notype_config::Provider::Qwen,
         "mimo" | "xiaomi" => notype_config::Provider::Mimo,
         "volcengine" | "volc" | "doubao" => notype_config::Provider::Volcengine,
-        "whisper" | "openai" => notype_config::Provider::Whisper,
+        "whisper" => notype_config::Provider::Whisper,
         "apple" => notype_config::Provider::Apple,
+        "gpt_realtime" | "gptrealtime" | "realtime" => notype_config::Provider::GptRealtime,
         _ => notype_config::Provider::Gemini,
     };
     if !dto.gemini_api_key.is_empty() {
@@ -949,6 +952,12 @@ async fn save_config(
         config.model.whisper_model = dto.whisper_model.trim().to_string();
     }
     config.model.apple_locale = dto.apple_locale.trim().to_string();
+    if !dto.openai_api_key.is_empty() {
+        config.model.openai_api_key = dto.openai_api_key;
+    }
+    if !dto.openai_realtime_model.trim().is_empty() {
+        config.model.openai_realtime_model = dto.openai_realtime_model.trim().to_string();
+    }
     config.model.enable_postprocess = dto.enable_postprocess;
     config.model.postprocess_provider = match dto.postprocess_provider.as_str() {
         "custom" => notype_config::PostprocessProvider::Custom,
@@ -1052,6 +1061,10 @@ struct ConfigDto {
     #[serde(default)]
     apple_locale: String,
     #[serde(default)]
+    openai_api_key: String,
+    #[serde(default)]
+    openai_realtime_model: String,
+    #[serde(default)]
     enable_postprocess: bool,
     #[serde(default)]
     postprocess_provider: String,
@@ -1095,6 +1108,8 @@ struct ConfigDto {
     #[serde(default)]
     has_whisper_key: bool,
     #[serde(default)]
+    has_openai_key: bool,
+    #[serde(default)]
     has_custom_llm_key: bool,
 }
 
@@ -1107,6 +1122,7 @@ impl ConfigDto {
             notype_config::Provider::Volcengine => "volcengine",
             notype_config::Provider::Whisper => "whisper",
             notype_config::Provider::Apple => "apple",
+            notype_config::Provider::GptRealtime => "gpt_realtime",
         };
         Self {
             provider: provider.into(),
@@ -1122,6 +1138,8 @@ impl ConfigDto {
             whisper_api_key: String::new(),
             whisper_model: config.model.whisper_model.clone(),
             apple_locale: config.model.apple_locale.clone(),
+            openai_api_key: String::new(),
+            openai_realtime_model: config.model.openai_realtime_model.clone(),
             enable_postprocess: config.model.enable_postprocess,
             postprocess_provider: match config.model.postprocess_provider {
                 notype_config::PostprocessProvider::Auto => "auto",
@@ -1163,6 +1181,7 @@ impl ConfigDto {
             has_volc_keys: !config.model.volc_app_key.is_empty()
                 && !config.model.volc_access_key.is_empty(),
             has_whisper_key: !config.model.whisper_api_key.is_empty(),
+            has_openai_key: !config.model.openai_api_key.is_empty(),
             has_custom_llm_key: !config.model.custom_llm_api_key.is_empty(),
         }
     }
@@ -1465,6 +1484,12 @@ async fn interim_loop(
         let cfg = config.read().await;
         (cfg.model.provider.clone(), cfg.model.is_asr_pipeline())
     };
+
+    // GPT Realtime opens a fresh WebSocket per request; polling it every
+    // interval would be wasteful, so skip interim preview (final only).
+    if matches!(provider, notype_config::Provider::GptRealtime) {
+        return;
+    }
 
     if matches!(provider, notype_config::Provider::Volcengine) {
         interim_loop_volcengine(
@@ -2010,6 +2035,7 @@ async fn process_audio(
             notype_config::Provider::Volcengine => "volcengine",
             notype_config::Provider::Whisper => "whisper",
             notype_config::Provider::Apple => "apple",
+            notype_config::Provider::GptRealtime => "gpt_realtime",
         };
         let active_app = {
             let state = app.state::<AppState>();
@@ -2257,11 +2283,13 @@ fn build_recognizer(config: &notype_config::AppConfig) -> Option<Box<dyn VoiceRe
         notype_config::Provider::Volcengine => notype_llm::Provider::Volcengine,
         notype_config::Provider::Whisper => notype_llm::Provider::Whisper,
         notype_config::Provider::Apple => notype_llm::Provider::Apple,
+        notype_config::Provider::GptRealtime => notype_llm::Provider::GptRealtime,
     };
 
-    // Whisper engines have a dedicated model field; others share model_name.
+    // Some engines have a dedicated model field; others share model_name.
     let model = match config.model.provider {
         notype_config::Provider::Whisper => Some(config.model.whisper_model.clone()),
+        notype_config::Provider::GptRealtime => Some(config.model.openai_realtime_model.clone()),
         _ => Some(config.model.model_name.clone()),
     };
 
@@ -2277,6 +2305,7 @@ fn build_recognizer(config: &notype_config::AppConfig) -> Option<Box<dyn VoiceRe
             volc_resource_id: Some(config.model.volc_resource_id.clone()),
             whisper_base_url: Some(config.model.whisper_base_url.clone()),
             apple_locale: Some(config.model.apple_locale.clone()),
+            openai_api_key: Some(config.model.openai_api_key.clone()),
         },
     ))
 }

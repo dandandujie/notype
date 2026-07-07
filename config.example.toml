@@ -28,7 +28,7 @@ app_rules = ""
 sound_feedback = true
 
 [model]
-# 识别引擎: "qwen" | "gemini" | "mimo" | "volcengine" | "whisper" | "apple"
+# 识别引擎: "qwen" | "gemini" | "mimo" | "volcengine" | "whisper" | "apple" | "gpt_realtime"
 provider = "qwen"
 # 多模态引擎的模型名（volcengine/whisper/apple 不使用此字段）
 # Qwen 可选: qwen3.5-omni-flash / qwen3.5-omni-plus（多模态直识别）
@@ -59,6 +59,11 @@ whisper_model = "whisper-1"
 # ---- Apple Speech（macOS 本地识别，免费离线）----
 # BCP-47 语言代码，留空跟随系统，如 "zh-CN" / "en-US"
 apple_locale = ""
+
+# ---- GPT Realtime（OpenAI Realtime WebSocket 转录，gpt-realtime 系列）----
+openai_api_key = ""
+# gpt-4o-transcribe | gpt-4o-mini-transcribe | gpt-realtime-whisper | whisper-1
+openai_realtime_model = "gpt-4o-transcribe"
 
 # ---- LLM 润色（对 ASR 引擎生效：volcengine / whisper / apple / qwen3-asr）----
 enable_postprocess = true

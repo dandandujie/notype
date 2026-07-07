@@ -62,10 +62,12 @@
 | Qwen `qwen3.5-omni-flash / plus` | 多模态直识别 | 推荐日常使用，中文效果好；接入点可改成本地 vLLM/SGLang 部署 |
 | Qwen `qwen3-asr-flash` | 专用 ASR | DashScope 专用识别模型，走 LLM 润色管线 |
 | Gemini `gemini-3-flash / 3.1-flash-lite` | 多模态直识别 | 多语言，lite 适合高频 |
-| Xiaomi MiMo `mimo-v2.5-asr` 等 | 多模态直识别 | 小米 MiMo 系列 |
+| Xiaomi MiMo `mimo-v2.5-asr` | 专用 ASR | 小米 MiMo ASR，走 LLM 润色管线 |
+| Xiaomi MiMo `mimo-v2.5` / omni | 多模态直识别 | 小米 MiMo 多模态 |
 | **火山引擎流式 ASR** | 专用 ASR（流式） | 官方豆包大模型识别 WebSocket 协议，说话时实时出字，纯 Rust 实现零外部依赖 |
 | **Whisper 兼容** | 专用 ASR（批量） | 任意 `/v1/audio/transcriptions` 服务：OpenAI、Groq、whisper.cpp server、faster-whisper、本地 vLLM |
 | **Apple Speech** | 专用 ASR（本地） | macOS 系统识别，免费、离线、零配置 |
+| **GPT Realtime** | 专用 ASR（流式） | OpenAI Realtime WebSocket 转录，gpt-4o-transcribe / gpt-realtime 系列 |
 
 专用 ASR 引擎的粗转写默认交给 LLM 润色（自动分段、数字格式化、符号口令、词汇校正、改口清理），润色服务可选任意 OpenAI 兼容厂商。
 

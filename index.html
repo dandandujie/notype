@@ -150,6 +150,7 @@
                 <button type="button" class="seg-btn" data-value="volcengine">火山流式</button>
                 <button type="button" class="seg-btn" data-value="whisper">Whisper</button>
                 <button type="button" class="seg-btn" data-value="apple">Apple</button>
+                <button type="button" class="seg-btn" data-value="gpt_realtime">GPT&nbsp;Realtime</button>
               </div>
             </div>
 
@@ -284,6 +285,31 @@
                 <span class="s-label">识别语言（BCP-47）</span>
                 <input type="text" id="apple-locale" placeholder="留空跟随系统，如 zh-CN / en-US" autocomplete="off" spellcheck="false" />
                 <span class="s-hint">macOS 本地识别，免费离线。首次使用会弹出「语音识别」授权，请允许</span>
+              </label>
+            </div>
+
+            <div id="gpt-realtime-fields" hidden>
+              <label class="s-field">
+                <span class="s-label">OpenAI API Key</span>
+                <div class="s-key-row">
+                  <input type="password" id="openai-api-key" placeholder="粘贴 OpenAI Key（sk-…）" autocomplete="off" spellcheck="false" />
+                  <button type="button" class="s-eye toggle-key-btn" data-target="openai-api-key" title="显示 / 隐藏">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                  </button>
+                </div>
+                <span class="s-hint" id="openai-key-hint"></span>
+              </label>
+              <label class="s-field">
+                <span class="s-label">模型</span>
+                <div class="s-select">
+                  <select id="openai-realtime-model">
+                    <option value="gpt-4o-transcribe">gpt-4o-transcribe（推荐）</option>
+                    <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe（更快更省）</option>
+                    <option value="gpt-realtime-whisper">gpt-realtime-whisper（最低延迟）</option>
+                    <option value="whisper-1">whisper-1</option>
+                  </select>
+                </div>
+                <span class="s-hint">通过 Realtime WebSocket 转录，粗转写再交给下方 AI 润色</span>
               </label>
             </div>
           </div>

@@ -130,6 +130,11 @@ pub struct ModelConfig {
     /// Apple Speech locale (BCP-47, e.g. "zh-CN"); empty = system default.
     #[serde(default)]
     pub apple_locale: String,
+    /// OpenAI Realtime transcription (gpt-realtime series).
+    #[serde(default)]
+    pub openai_api_key: String,
+    #[serde(default = "default_openai_realtime_model")]
+    pub openai_realtime_model: String,
     /// Polish raw ASR text with an LLM (applies to ASR engines only —
     /// multimodal providers already polish in one pass).
     #[serde(default = "default_true", alias = "enable_doubao_postprocess")]
@@ -171,6 +176,9 @@ pub enum Provider {
     Whisper,
     #[serde(rename = "apple")]
     Apple,
+    /// OpenAI Realtime transcription (gpt-realtime series, WebSocket).
+    #[serde(rename = "gpt_realtime", alias = "gptrealtime", alias = "realtime")]
+    GptRealtime,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -222,6 +230,10 @@ fn default_whisper_base_url() -> String {
 
 fn default_whisper_model() -> String {
     "whisper-1".into()
+}
+
+fn default_openai_realtime_model() -> String {
+    "gpt-4o-transcribe".into()
 }
 
 impl Default for GeneralConfig {
@@ -575,6 +587,8 @@ impl Default for ModelConfig {
             whisper_api_key: String::new(),
             whisper_model: default_whisper_model(),
             apple_locale: String::new(),
+            openai_api_key: String::new(),
+            openai_realtime_model: default_openai_realtime_model(),
             enable_postprocess: true,
             postprocess_provider: PostprocessProvider::Auto,
             custom_llm_base_url: String::new(),
@@ -594,6 +608,7 @@ impl ModelConfig {
             Provider::Qwen => &self.qwen_api_key,
             Provider::Mimo => &self.mimo_api_key,
             Provider::Whisper => &self.whisper_api_key,
+            Provider::GptRealtime => &self.openai_api_key,
             // Volcengine uses its dedicated app/access keys; Apple needs none.
             Provider::Volcengine | Provider::Apple => "",
         }
@@ -610,9 +625,13 @@ impl ModelConfig {
     /// inside the recognition prompt instead.
     pub fn is_asr_pipeline(&self) -> bool {
         match self.provider {
-            Provider::Volcengine | Provider::Whisper | Provider::Apple => true,
-            Provider::Qwen => self.model_name.to_lowercase().contains("asr"),
-            Provider::Gemini | Provider::Mimo => false,
+            Provider::Volcengine | Provider::Whisper | Provider::Apple | Provider::GptRealtime => {
+                true
+            }
+            // `-asr` models are pure transcribers → route through LLM polish;
+            // multimodal variants (omni/pro) polish inline via the prompt.
+            Provider::Qwen | Provider::Mimo => self.model_name.to_lowercase().contains("asr"),
+            Provider::Gemini => false,
         }
     }
 
@@ -630,6 +649,7 @@ impl ModelConfig {
             // Whisper-compatible servers may be keyless (whisper.cpp, local vLLM).
             Provider::Whisper => !self.whisper_base_url.trim().is_empty(),
             Provider::Apple => cfg!(target_os = "macos"),
+            Provider::GptRealtime => !self.openai_api_key.trim().is_empty(),
         }
     }
 }
@@ -722,6 +742,11 @@ fn migrate_legacy_key(config: &mut AppConfig) {
                 config.model.whisper_api_key = std::mem::take(&mut config.model.api_key);
             }
         }
+        Provider::GptRealtime => {
+            if config.model.openai_api_key.is_empty() {
+                config.model.openai_api_key = std::mem::take(&mut config.model.api_key);
+            }
+        }
         Provider::Volcengine | Provider::Apple => {}
     }
     config.model.api_key.clear();
@@ -749,8 +774,11 @@ fn apply_env_overrides(config: &mut AppConfig) {
             "qwen" => config.model.provider = Provider::Qwen,
             "mimo" | "xiaomi" => config.model.provider = Provider::Mimo,
             "volcengine" | "volc" | "doubao" => config.model.provider = Provider::Volcengine,
-            "whisper" | "openai" => config.model.provider = Provider::Whisper,
+            "whisper" => config.model.provider = Provider::Whisper,
             "apple" => config.model.provider = Provider::Apple,
+            "gpt_realtime" | "gptrealtime" | "realtime" | "openai" => {
+                config.model.provider = Provider::GptRealtime
+            }
             _ => tracing::warn!(
                 provider = %provider,
                 "Unknown provider in NOTYPE_PROVIDER, ignoring"
@@ -767,6 +795,7 @@ fn apply_env_overrides(config: &mut AppConfig) {
                 Provider::Qwen => config.model.qwen_api_key = key,
                 Provider::Mimo => config.model.mimo_api_key = key,
                 Provider::Whisper => config.model.whisper_api_key = key,
+                Provider::GptRealtime => config.model.openai_api_key = key,
                 Provider::Volcengine | Provider::Apple => {}
             }
         }
@@ -794,6 +823,10 @@ fn apply_env_overrides(config: &mut AppConfig) {
         }),
         ("NOTYPE_WHISPER_API_KEY", |c, v| c.model.whisper_api_key = v),
         ("NOTYPE_WHISPER_MODEL", |c, v| c.model.whisper_model = v),
+        ("NOTYPE_OPENAI_API_KEY", |c, v| c.model.openai_api_key = v),
+        ("NOTYPE_OPENAI_REALTIME_MODEL", |c, v| {
+            c.model.openai_realtime_model = v
+        }),
         ("NOTYPE_CUSTOM_LLM_BASE_URL", |c, v| {
             c.model.custom_llm_base_url = v
         }),
@@ -873,6 +906,14 @@ mod tests {
         config.model.model_name = "qwen3.5-omni-flash".into();
         assert!(!config.model.is_asr_pipeline());
         config.model.model_name = "qwen3-asr-flash".into();
+        assert!(config.model.is_asr_pipeline());
+        // MiMo asr variant → pipeline; multimodal variant → direct.
+        config.model.provider = Provider::Mimo;
+        config.model.model_name = "mimo-v2.5-asr".into();
+        assert!(config.model.is_asr_pipeline());
+        config.model.model_name = "mimo-v2.5".into();
+        assert!(!config.model.is_asr_pipeline());
+        config.model.provider = Provider::GptRealtime;
         assert!(config.model.is_asr_pipeline());
         config.model.provider = Provider::Volcengine;
         assert!(config.model.is_asr_pipeline());
